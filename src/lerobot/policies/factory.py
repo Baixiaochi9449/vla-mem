@@ -34,6 +34,11 @@ from lerobot.policies.groot.configuration_groot import GrootConfig
 from lerobot.policies.multi_task_dit.configuration_multi_task_dit import MultiTaskDiTConfig
 from lerobot.policies.pi0.configuration_pi0 import PI0Config
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
+try:
+    from lerobot.policies.pi05_v1.configuration_pi05_v1 import PI05V1Config
+except ImportError:
+    PI05V1Config = None
+from lerobot.policies.pi05_v2_deepseek.configuration_pi05_v2_deepseek import PI05V2DeepseekConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.sac.configuration_sac import SACConfig
 from lerobot.policies.sac.reward_model.configuration_classifier import RewardClassifierConfig
@@ -57,6 +62,21 @@ from lerobot.utils.constants import (
     POLICY_POSTPROCESSOR_DEFAULT_NAME,
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
+
+
+def _should_load_saved_processors(
+    policy_cfg: PreTrainedConfig,
+    pretrained_path: str | None,
+) -> bool:
+    if not pretrained_path:
+        return False
+
+    try:
+        pretrained_cfg = PreTrainedConfig.from_pretrained(pretrained_path)
+    except (FileNotFoundError, ValueError, TypeError):
+        return True
+
+    return pretrained_cfg.type == policy_cfg.type
 
 
 def get_policy_class(name: str) -> type[PreTrainedPolicy]:
@@ -107,6 +127,14 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.pi05.modeling_pi05 import PI05Policy
 
         return PI05Policy
+    elif name == "pi05_v1":
+        from lerobot.policies.pi05_v1.modeling_pi05_v1 import PI05V1Policy
+
+        return PI05V1Policy
+    elif name == "pi05_v2_deepseek":
+        from lerobot.policies.pi05_v2_deepseek.modeling_pi05_v2_deepseek import PI05V2DeepseekPolicy
+
+        return PI05V2DeepseekPolicy
     elif name == "sac":
         from lerobot.policies.sac.modeling_sac import SACPolicy
 
@@ -175,6 +203,12 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return PI0Config(**kwargs)
     elif policy_type == "pi05":
         return PI05Config(**kwargs)
+    elif policy_type == "pi05_v1":
+        if PI05V1Config is None:
+            raise ValueError("Policy type 'pi05_v1' is unavailable because its configuration could not be imported.")
+        return PI05V1Config(**kwargs)
+    elif policy_type == "pi05_v2_deepseek":
+        return PI05V2DeepseekConfig(**kwargs)
     elif policy_type == "sac":
         return SACConfig(**kwargs)
     elif policy_type == "smolvla":
@@ -247,7 +281,7 @@ def make_pre_post_processors(
         NotImplementedError: If a processor factory is not implemented for the given
             policy configuration type.
     """
-    if pretrained_path:
+    if _should_load_saved_processors(policy_cfg, pretrained_path):
         # TODO(Steven): Temporary patch, implement correctly the processors for Gr00t
         if isinstance(policy_cfg, GrootConfig):
             # GROOT handles normalization in groot_pack_inputs_v3 step
@@ -341,10 +375,28 @@ def make_pre_post_processors(
             dataset_stats=kwargs.get("dataset_stats"),
         )
 
+    elif PI05V1Config is not None and isinstance(policy_cfg, PI05V1Config):
+        from lerobot.policies.pi05_v1.processor_pi05_v1 import make_pi05_v1_pre_post_processors
+
+        processors = make_pi05_v1_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
     elif isinstance(policy_cfg, PI05Config):
         from lerobot.policies.pi05.processor_pi05 import make_pi05_pre_post_processors
 
         processors = make_pi05_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, PI05V2DeepseekConfig):
+        from lerobot.policies.pi05_v2_deepseek.processor_pi05_v2_deepseek import (
+            make_pi05_v2_deepseek_pre_post_processors,
+        )
+
+        processors = make_pi05_v2_deepseek_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )

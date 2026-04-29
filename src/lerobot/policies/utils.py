@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import logging
+from collections.abc import Iterable, Mapping
 from collections import deque
 
 import numpy as np
@@ -223,23 +224,43 @@ def raise_feature_mismatch_error(
     )
 
 
+def _coerce_visual_feature_keys(features: Mapping[str, object] | Iterable[str]) -> set[str]:
+    if isinstance(features, Mapping):
+        if all(hasattr(value, "type") for value in features.values()):
+            return {key for key, value in features.items() if getattr(value, "type", None) == FeatureType.VISUAL}
+        return set(features)
+
+    return set(features)
+
+
 def validate_visual_features_consistency(
-    cfg: PreTrainedConfig,
-    features: dict[str, PolicyFeature],
+    cfg_or_dataset_image_keys: PreTrainedConfig | Mapping[str, object] | Iterable[str],
+    features_or_policy_image_features: Mapping[str, object] | Iterable[str],
+    rename_map: dict[str, str] | None = None,
 ) -> None:
     """
     Validates visual feature consistency between a policy config and provided dataset/environment features.
 
-    Validation passes if EITHER:
-    - Policy's expected visuals are a subset of dataset (policy uses some cameras, dataset has more)
-    - Dataset's provided visuals are a subset of policy (policy declares extras for flexibility)
+    Supports both of these call patterns:
+    - validate_visual_features_consistency(policy_cfg, dataset_or_env_features)
+    - validate_visual_features_consistency(dataset_image_keys, policy_image_features, rename_map)
 
     Args:
-        cfg (PreTrainedConfig): The model or policy configuration containing input_features and type.
-        features (Dict[str, PolicyFeature]): A mapping of feature names to PolicyFeature objects.
+        cfg_or_dataset_image_keys: Either a policy config or dataset/env image keys.
+        features_or_policy_image_features: Either full dataset/env features or policy image features.
+        rename_map: Optional mapping from dataset/env keys to policy keys.
     """
-    expected_visuals = {k for k, v in cfg.input_features.items() if v.type == FeatureType.VISUAL}
-    provided_visuals = {k for k, v in features.items() if v.type == FeatureType.VISUAL}
+    rename_map = rename_map or {}
+
+    if isinstance(cfg_or_dataset_image_keys, PreTrainedConfig):
+        expected_visuals = _coerce_visual_feature_keys(cfg_or_dataset_image_keys.input_features or {})
+        provided_visuals = _coerce_visual_feature_keys(features_or_policy_image_features)
+    else:
+        expected_visuals = _coerce_visual_feature_keys(features_or_policy_image_features)
+        provided_visuals = {
+            rename_map.get(feature_key, feature_key)
+            for feature_key in _coerce_visual_feature_keys(cfg_or_dataset_image_keys)
+        }
 
     # Accept if either direction is a subset
     policy_subset_of_dataset = expected_visuals.issubset(provided_visuals)

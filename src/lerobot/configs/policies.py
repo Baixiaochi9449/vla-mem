@@ -187,7 +187,7 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
                 logger.error(f"{CONFIG_NAME} not found in {Path(model_id).resolve()}")
         else:
             try:
-                config_file = hf_hub_download(
+                config_file = hf_hub_download( #调用 huggingface_hub 的下载接口
                     repo_id=model_id,
                     filename=CONFIG_NAME,
                     revision=revision,

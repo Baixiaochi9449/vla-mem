@@ -14,10 +14,43 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
+import os
+import sys
 from collections import defaultdict
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, MutableMapping, Sequence
 from pathlib import Path
 from typing import Any
+
+
+def _should_use_headless_egl(
+    environ: Mapping[str, str] | None = None,
+    platform: str | None = None,
+) -> bool:
+    environ = os.environ if environ is None else environ
+    platform = sys.platform if platform is None else platform
+
+    if not platform.startswith("linux"):
+        return False
+    if environ.get("MUJOCO_GL"):
+        return False
+    return not (environ.get("DISPLAY") or environ.get("WAYLAND_DISPLAY"))
+
+
+def _configure_mujoco_gl_backend(
+    environ: MutableMapping[str, str] | None = None,
+    platform: str | None = None,
+) -> str | None:
+    environ = os.environ if environ is None else environ
+
+    if _should_use_headless_egl(environ=environ, platform=platform):
+        environ["MUJOCO_GL"] = "egl"
+        return "egl"
+
+    return environ.get("MUJOCO_GL")
+
+
+# MuJoCo defaults to GLFW, which fails on headless Linux during MetaWorld eval.
+_configure_mujoco_gl_backend()
 
 import gymnasium as gym
 import metaworld
