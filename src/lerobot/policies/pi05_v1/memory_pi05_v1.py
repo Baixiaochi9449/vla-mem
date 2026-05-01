@@ -171,7 +171,14 @@ class EpisodicMemoryBank(nn.Module):
 		return self._online_state
 
 	def build_query(self, prefix_summary: Tensor, current_state: Tensor) -> Tensor:
-		query_inputs = torch.cat([prefix_summary, current_state], dim=-1)
+		proj_dtype = self.read_query_proj[0].weight.dtype
+		query_inputs = torch.cat(
+			[
+				prefix_summary.to(dtype=proj_dtype),
+				current_state.to(dtype=proj_dtype),
+			],
+			dim=-1,
+		)
 		return F.normalize(self.read_query_proj(query_inputs), dim=-1, eps=1e-6)
 
 	def encode_write(
@@ -180,8 +187,13 @@ class EpisodicMemoryBank(nn.Module):
 		current_state: Tensor,
 		action_summary: Tensor | None = None,
 	) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+		proj_dtype = self.write_key_proj[0].weight.dtype
+		write_summary = write_summary.to(dtype=proj_dtype)
+		current_state = current_state.to(dtype=proj_dtype)
 		if action_summary is None:
 			action_summary = write_summary.new_zeros(write_summary.shape[0], self.action_dim)
+		else:
+			action_summary = action_summary.to(dtype=proj_dtype)
 
 		write_inputs = torch.cat([write_summary, current_state, action_summary], dim=-1)
 		write_key = F.normalize(self.write_key_proj(write_inputs), dim=-1, eps=1e-6)
@@ -202,7 +214,7 @@ class EpisodicMemoryBank(nn.Module):
 		valid_mask: Tensor | None = None,
 	) -> tuple[MemoryState, dict[str, Tensor]]:
 		batch_size = write_summary.shape[0]
-		dtype = write_summary.dtype
+		dtype = state.keys.dtype
 		if valid_mask is None:
 			valid_mask = torch.ones(batch_size, dtype=torch.bool, device=write_summary.device)
 
@@ -373,11 +385,13 @@ class EpisodicMemoryBank(nn.Module):
 		)
 
 	def read_online(self, query: Tensor) -> MemoryReadResult:
-		online_state = self.ensure_online_state(query.shape[0], query.device, query.dtype)
+		memory_dtype = self.read_query_proj[0].weight.dtype
+		online_state = self.ensure_online_state(query.shape[0], query.device, memory_dtype)
 		return self.read_from_state(online_state, query)
 
 	def update_online(self, write_summary: Tensor, current_state: Tensor, action_summary: Tensor | None = None) -> None:
-		online_state = self.ensure_online_state(write_summary.shape[0], write_summary.device, write_summary.dtype)
+		memory_dtype = self.write_key_proj[0].weight.dtype
+		online_state = self.ensure_online_state(write_summary.shape[0], write_summary.device, memory_dtype)
 		new_state, _ = self.write_step(
 			state=online_state,
 			write_summary=write_summary,
