@@ -33,6 +33,10 @@ from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.groot.configuration_groot import GrootConfig
 from lerobot.policies.multi_task_dit.configuration_multi_task_dit import MultiTaskDiTConfig
 from lerobot.policies.pi0.configuration_pi0 import PI0Config
+try:
+    from lerobot.policies.pi0_v3.configuration_pi0_v3 import PI0V3Config
+except ImportError:
+    PI0V3Config = None
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
 try:
     from lerobot.policies.pi05_v1.configuration_pi05_v1 import PI05V1Config
@@ -119,6 +123,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.pi0.modeling_pi0 import PI0Policy
 
         return PI0Policy
+    elif name == "pi0_v3":
+        from lerobot.policies.pi0_v3.modeling_pi0_v3 import PI0V3Policy
+
+        return PI0V3Policy
     elif name == "pi0_fast":
         from lerobot.policies.pi0_fast.modeling_pi0_fast import PI0FastPolicy
 
@@ -201,6 +209,10 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return VQBeTConfig(**kwargs)
     elif policy_type == "pi0":
         return PI0Config(**kwargs)
+    elif policy_type == "pi0_v3":
+        if PI0V3Config is None:
+            raise ValueError("Policy type 'pi0_v3' is unavailable because its configuration could not be imported.")
+        return PI0V3Config(**kwargs)
     elif policy_type == "pi05":
         return PI05Config(**kwargs)
     elif policy_type == "pi05_v1":
@@ -371,6 +383,14 @@ def make_pre_post_processors(
         from lerobot.policies.pi0.processor_pi0 import make_pi0_pre_post_processors
 
         processors = make_pi0_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif PI0V3Config is not None and isinstance(policy_cfg, PI0V3Config):
+        from lerobot.policies.pi0_v3.processor_pi0_v3 import make_pi0_v3_pre_post_processors
+
+        processors = make_pi0_v3_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )

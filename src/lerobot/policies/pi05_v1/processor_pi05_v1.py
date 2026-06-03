@@ -15,6 +15,9 @@
 # limitations under the License.
 
 from __future__ import annotations
+import os
+_PALIGEMMA_TOKENIZER_NAME = os.environ.get("PALIGEMMA_TOKENIZER_PATH", "google/paligemma-3b-pt-224")
+
 
 from copy import deepcopy
 from dataclasses import dataclass
@@ -174,7 +177,7 @@ def make_pi05_v1_pre_post_processors(
 		),
 		Pi05V1PrepareMemoryProcessorStep(max_state_dim=config.max_state_dim),
 		TokenizerProcessorStep(
-			tokenizer_name="google/paligemma-3b-pt-224",
+			tokenizer_name=_PALIGEMMA_TOKENIZER_NAME,
 			max_length=config.tokenizer_max_length,
 			padding_side="right",
 			padding="max_length",

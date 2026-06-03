@@ -14,9 +14,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
+
+# Allow overriding the paligemma tokenizer path via env var for offline use
+_PALIGEMMA_TOKENIZER_NAME = os.environ.get(
+    "PALIGEMMA_TOKENIZER_PATH", "google/paligemma-3b-pt-224"
+)
 
 import numpy as np
 import torch
@@ -138,7 +144,7 @@ def make_pi05_pre_post_processors(
         ),
         Pi05PrepareStateTokenizerProcessorStep(max_state_dim=config.max_state_dim),
         TokenizerProcessorStep(
-            tokenizer_name="google/paligemma-3b-pt-224",
+            tokenizer_name=_PALIGEMMA_TOKENIZER_NAME,
             max_length=config.tokenizer_max_length,
             padding_side="right",
             padding="max_length",

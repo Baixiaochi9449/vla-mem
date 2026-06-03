@@ -1,0 +1,193 @@
+# RoboMME
+
+**RoboMME** is a benchmark for **memory-augmented manipulation** built on top of ManiSkill. It focuses on tasks where a policy must remember prior visual context, object references, or multi-step demonstrations before acting.
+
+- 📄 [RoboMME paper](https://arxiv.org/abs/2603.04639)
+- 💻 [Original RoboMME repo](https://github.com/RoboMME/robomme_benchmark)
+- 🤗 [RoboMME dataset](https://huggingface.co/datasets/Yinpei/robomme_data_h5)
+
+The benchmark contains **16 tasks** across 4 suites:
+
+- **Counting**: BinFill, PickXtimes, SwingXtimes, StopCube
+- **Permanence**: VideoUnmask, VideoUnmaskSwap, ButtonUnmask, ButtonUnmaskSwap
+- **Reference**: PickHighlight, VideoRepick, VideoPlaceButton, VideoPlaceOrder
+- **Imitation**: MoveCube, InsertPeg, PatternLock, RouteStick
+
+## Installation
+
+LeRobot now exposes a `robomme` extra:
+
+```bash
+pip install -e ".[robomme]"
+```
+
+That is the intended one-command install path for RoboMME + PI in the same LeRobot environment.
+
+However, the current public dependency chain is still blocked upstream: `robomme` pulls `mani-skill`, and the public `mani-skill` package currently requires `mplib==0.1.1`, which is not available from the public index in this environment. In the Linux / Python 3.13 environment validated here, `pip install -e ".[robomme]"` still fails on that upstream `mplib` requirement.
+
+So the current situation is:
+
+- **PI compatibility**: no direct PI conflict was found. The blocker is upstream ManiSkill / mplib packaging, not PI itself.
+- **Conversion + training**: can already work without the `robomme` package installed, as long as the workspace still contains the local `robomme_benchmark` clone for split metadata.
+- **Environment evaluation**: still needs the `robomme` package plus its ManiSkill runtime to be importable.
+
+If you already have a separate RoboMME-capable environment recipe, you can still install RoboMME from your local clone there:
+
+```bash
+cd /path/to/robomme_benchmark
+uv sync
+uv pip install -e .
+```
+
+## Raw dataset location
+
+The recommended default location for raw RoboMME HDF5 files is:
+
+```bash
+~/.cache/huggingface/lerobot/raw/robomme_data_h5
+```
+
+This keeps raw HDF5 files separate from converted LeRobot datasets and from the Hub cache under `~/.cache/huggingface/lerobot/hub`.
+
+The new conversion script uses that location by default and can auto-download missing `record_dataset_<Task>.h5` files from Hugging Face.
+
+If you need to download from a mirror, set this before running any conversion command that pulls files from Hugging Face:
+
+```bash
+export HF_ENDPOINT=https://hf-mirror.com
+```
+
+If you already downloaded the raw RoboMME files manually, you can keep them in any local directory and pass that directory with `--raw-dir`.
+
+## Converting HDF5 to a LeRobot dataset
+
+LeRobot now provides a dedicated conversion command:
+
+```bash
+lerobot-convert-robomme \
+  --split=train \
+  --tasks=PickXtimes \
+  --action-space=ee_pose \
+  --max-episodes-per-task=1 \
+  --download-missing \
+  --repo-id=local/robomme_ee_pose_train \
+  --output-root=outputs/datasets/robomme_ee_pose_train
+```
+
+If you already have the raw files locally, use `--raw-dir` instead of `--download-missing`:
+
+```bash
+lerobot-convert-robomme \
+  --split=train \
+  --tasks=PickXtimes \
+  --action-space=ee_pose \
+  --max-episodes-per-task=1 \
+  --raw-dir=/path/to/RoboMME \
+  --repo-id=local/robomme_ee_pose_train \
+  --output-root=outputs/datasets/robomme_ee_pose_train
+```
+
+What this does:
+
+- Downloads missing raw HDF5 files to `~/.cache/huggingface/lerobot/raw/robomme_data_h5`
+- Reads split membership from RoboMME metadata
+- Skips conditioning-video frames (`info/is_video_demo=True`)
+- Converts RGB + state + action into a standard LeRobot local dataset
+
+Current conversion scope:
+
+- Supported action spaces: `ee_pose`, `joint_angle`
+- Images are stored as LeRobot `image` features, not encoded videos
+- Conditioning demo video is **not** added to the training schema yet
+
+## Evaluating with RoboMME
+
+LeRobot now provides a `robomme` environment adapter that maps RoboMME observations to the standard LeRobot keys:
+
+- `observation.images.image` -> front camera RGB
+- `observation.images.image2` -> wrist camera RGB
+- `observation.state` -> end-effector pose plus gripper state
+
+The adapter also forwards RoboMME task goals as the environment task description so text-conditioned policies can consume them through the existing LeRobot evaluation pipeline.
+
+### Single-task evaluation
+
+```bash
+lerobot-eval \
+  --policy.pretrained_path=lerobot/pi05_base \
+  --rename_map='{"observation.images.image":"observation.images.base_0_rgb","observation.images.image2":"observation.images.right_wrist_0_rgb"}' \
+  --env.type=robomme \
+  --env.task=PickXtimes \
+  --env.action_space=ee_pose \
+  --env.split=test \
+  --eval.batch_size=1 \
+  --eval.n_episodes=1
+```
+
+This command now parses `--policy.pretrained_path=...` directly. The `rename_map` is needed for `lerobot/pi05_base`, because RoboMME currently exposes `observation.images.image` and `observation.images.image2`, while the pretrained PI05 config expects `base_0_rgb`, `left_wrist_0_rgb`, and `right_wrist_0_rgb`. The missing third camera is padded automatically by the PI05 model.
+
+In the current environment, the remaining blocker for actually running evaluation is still the upstream RoboMME / ManiSkill runtime installation, not LeRobot's config parsing.
+
+### Multi-task evaluation
+
+```bash
+lerobot-eval \
+  --policy.pretrained_path=lerobot/pi05_base \
+  --rename_map='{"observation.images.image":"observation.images.base_0_rgb","observation.images.image2":"observation.images.right_wrist_0_rgb"}' \
+  --env.type=robomme \
+  --env.task=PickXtimes,MoveCube,VideoUnmask \
+  --env.action_space=ee_pose \
+  --env.split=test \
+  --eval.batch_size=1 \
+  --eval.n_episodes=2
+```
+
+### Evaluate all RoboMME tasks
+
+```bash
+lerobot-eval \
+  --policy.pretrained_path=lerobot/pi05_base \
+  --rename_map='{"observation.images.image":"observation.images.base_0_rgb","observation.images.image2":"observation.images.right_wrist_0_rgb"}' \
+  --env.type=robomme \
+  --env.task=all \
+  --env.action_space=ee_pose \
+  --env.split=test \
+  --eval.batch_size=1 \
+  --eval.n_episodes=2
+```
+
+## Current scope
+
+This integration now covers **evaluation wiring** and **offline dataset conversion**.
+
+- Supported action spaces: `ee_pose`, `joint_angle`
+- Not yet supported: `waypoint`, `multi_choice`
+- RoboMME benchmark code is still external; LeRobot does not vendor it
+- Offline training currently uses a current-observation baseline only
+
+## Episode semantics
+
+RoboMME uses fixed benchmark episodes for each split. The LeRobot adapter rotates benchmark episodes across resets so batched evaluation does not keep replaying the same episode slots.
+
+If `eval.n_episodes` exceeds the number of benchmark episodes available for a given task and split, evaluation will wrap around and start reusing episodes.
+
+## Training note
+
+Once you convert a split to a local LeRobot dataset, you can train from it directly. For a minimal smoke run with PI05 base:
+
+```bash
+lerobot-train \
+  --policy.pretrained_path=lerobot/pi05_base \
+  --dataset.repo_id=local/robomme_ee_pose_train \
+  --dataset.root=outputs/datasets/robomme_ee_pose_train \
+  --rename_map='{"observation.images.image":"observation.images.base_0_rgb","observation.images.image2":"observation.images.right_wrist_0_rgb"}' \
+  --steps=10 \
+  --batch_size=2 \
+  --log_freq=1 \
+  --save_checkpoint=false \
+  --eval_freq=0
+```
+
+This baseline only uses the current RGB observations plus the 8D state. It does **not** yet model RoboMME's conditioning demo video or longer-horizon memory context.
+
+The `rename_map` is required for `lerobot/pi05_base` for the same reason as evaluation. This path was validated here with a 1-step smoke train on a converted local RoboMME dataset.

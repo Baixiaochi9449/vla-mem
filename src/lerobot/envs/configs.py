@@ -19,6 +19,7 @@ from typing import Any
 import draccus
 
 from lerobot.configs.types import FeatureType, PolicyFeature
+from lerobot.envs.robomme import ROBOMME_ACTION_SPACE_SHAPES, ROBOMME_SPLITS, normalize_robomme_task_names
 from lerobot.robots import RobotConfig
 from lerobot.teleoperators.config import TeleoperatorConfig
 from lerobot.utils.constants import (
@@ -386,6 +387,67 @@ class MetaworldEnv(EnvConfig):
             "obs_type": self.obs_type,
             "render_mode": self.render_mode,
         }
+
+
+@EnvConfig.register_subclass("robomme")
+@dataclass
+class RobommeEnv(EnvConfig):
+    task: str = "all"
+    split: str = "test"
+    action_space: str = "ee_pose"
+    fps: int = 30
+    episode_length: int = 1300
+    observation_height: int = 256
+    observation_width: int = 256
+    gui_render: bool = False
+    episode_indices: list[int] | None = None
+    features: dict[str, PolicyFeature] = field(default_factory=dict)
+    features_map: dict[str, str] = field(
+        default_factory=lambda: {
+            ACTION: ACTION,
+            "agent_pos": OBS_STATE,
+            "pixels/image": f"{OBS_IMAGES}.image",
+            "pixels/image2": f"{OBS_IMAGES}.image2",
+        }
+    )
+
+    def __post_init__(self):
+        normalize_robomme_task_names(self.task)
+        if self.split not in ROBOMME_SPLITS:
+            raise ValueError(f"Unsupported split: {self.split}. Expected one of {ROBOMME_SPLITS}.")
+        if self.action_space not in ROBOMME_ACTION_SPACE_SHAPES:
+            raise ValueError(
+                f"Unsupported action_space: {self.action_space}. "
+                f"Expected one of {tuple(ROBOMME_ACTION_SPACE_SHAPES)}."
+            )
+
+        self.features[ACTION] = PolicyFeature(
+            type=FeatureType.ACTION,
+            shape=(ROBOMME_ACTION_SPACE_SHAPES[self.action_space],),
+        )
+        self.features["agent_pos"] = PolicyFeature(type=FeatureType.STATE, shape=(8,))
+        self.features["pixels/image"] = PolicyFeature(
+            type=FeatureType.VISUAL,
+            shape=(self.observation_height, self.observation_width, 3),
+        )
+        self.features["pixels/image2"] = PolicyFeature(
+            type=FeatureType.VISUAL,
+            shape=(self.observation_height, self.observation_width, 3),
+        )
+
+    @property
+    def gym_kwargs(self) -> dict:
+        kwargs: dict[str, Any] = {
+            "split": self.split,
+            "action_space": self.action_space,
+            "episode_length": self.episode_length,
+            "observation_height": self.observation_height,
+            "observation_width": self.observation_width,
+            "gui_render": self.gui_render,
+        }
+        if self.episode_indices is not None:
+            kwargs["episode_indices"] = self.episode_indices
+        return kwargs
 
 
 @EnvConfig.register_subclass("isaaclab_arena")

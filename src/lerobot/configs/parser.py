@@ -30,6 +30,7 @@ from lerobot.utils.utils import has_method
 F = TypeVar("F", bound=Callable[..., object])
 
 PATH_KEY = "path"
+PRETRAINED_PATH_KEY = "pretrained_path"
 PLUGIN_DISCOVERY_SUFFIX = "discover_packages_path"
 
 
@@ -46,7 +47,11 @@ def get_cli_overrides(field_name: str, args: Sequence[str] | None = None) -> lis
         args = sys.argv[1:]
     attr_level_args = []
     detect_string = f"--{field_name}."
-    exclude_strings = (f"--{field_name}.{draccus.CHOICE_TYPE_KEY}=", f"--{field_name}.{PATH_KEY}=")
+    exclude_strings = (
+        f"--{field_name}.{draccus.CHOICE_TYPE_KEY}=",
+        f"--{field_name}.{PATH_KEY}=",
+        f"--{field_name}.{PRETRAINED_PATH_KEY}=",
+    )
     for arg in args:
         if arg.startswith(detect_string) and not arg.startswith(exclude_strings):
             denested_arg = f"--{arg.removeprefix(detect_string)}"
@@ -148,6 +153,10 @@ def get_path_arg(field_name: str, args: Sequence[str] | None = None) -> str | No
     return parse_arg(f"{field_name}.{PATH_KEY}", args)
 
 
+def get_pretrained_path_arg(field_name: str, args: Sequence[str] | None = None) -> str | None:
+    return parse_arg(f"{field_name}.{PRETRAINED_PATH_KEY}", args)
+
+
 def get_type_arg(field_name: str, args: Sequence[str] | None = None) -> str | None:
     return parse_arg(f"{field_name}.{draccus.CHOICE_TYPE_KEY}", args)
 
@@ -181,11 +190,14 @@ def filter_path_args(fields_to_filter: str | list[str], args: Sequence[str] | No
     filtered_args = [] if args is None else list(args)
 
     for field in fields_to_filter:
-        if get_path_arg(field, args):
+        if get_path_arg(field, args) or get_pretrained_path_arg(field, args):
             if get_type_arg(field, args):
                 raise ArgumentError(
                     argument=None,
-                    message=f"Cannot specify both --{field}.{PATH_KEY} and --{field}.{draccus.CHOICE_TYPE_KEY}",
+                    message=(
+                        f"Cannot specify both a path-based policy reference (--{field}.{PATH_KEY} or "
+                        f"--{field}.{PRETRAINED_PATH_KEY}) and --{field}.{draccus.CHOICE_TYPE_KEY}"
+                    ),
                 )
             filtered_args = [arg for arg in filtered_args if not arg.startswith(f"--{field}.")]
 

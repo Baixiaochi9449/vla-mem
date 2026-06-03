@@ -1,0 +1,348 @@
+# π₀-V3 (Pi0V3)
+
+pi0_v3 is a memory-augmented policy built on top of the LeRobot π₀.₅ stack. It keeps the same core Vision-Language-Action decomposition as PI05, but adds a hybrid memory path designed for limited offline data: a short-horizon recent-token path plus a longer-horizon slot memory bank.
+
+The implementation lives in the pi0-v3 policy package and is registered as:
+
+```python
+policy.type=pi0_v3
+```
+
+## What The Model Consumes And Produces
+
+### Inputs
+
+At each training step, pi0_v3 consumes four groups of inputs:
+
+1. Current observation:
+   - current RGB observation(s)
+   - current robot state
+   - current task text
+
+2. Memory history window:
+   - state history from `observation_delta_indices`
+   - optional image history aligned to the same lookback window
+   - optional action history from `action_delta_indices`
+
+3. Diffusion target:
+   - clean future action chunk from the dataset
+   - sampled noise
+   - sampled diffusion time
+
+4. Padding metadata:
+   - per-step state pad mask
+   - per-camera image pad mask
+   - optional action-history pad mask
+
+The processor splits these inputs deliberately:
+
+- The latest frame and latest state remain the main policy observation.
+- The full temporal window is stored in side-channel keys such as `memory.state_window`, `memory.image_window.*`, and `memory.action_window`.
+- The language prompt is rebuilt into PI-style text of the form `Task: ... State: ... Action:`.
+
+### Outputs
+
+The model predicts a continuous action chunk of shape `(batch, chunk_size, action_dim)`.
+
+- In training, the model predicts the diffusion velocity `v_t` for the full chunk and is optimized with MSE against the flow target.
+- In inference, `predict_action_chunk()` returns the full chunk.
+- `select_action()` dequeues the first `n_action_steps` actions from that chunk and feeds executed actions back into the online action-history cache.
+
+## Architecture
+
+pi0_v3 keeps the PI05 two-branch structure:
+
+- Prefix branch: image and language tokens through a PaliGemma-style VLM backbone.
+- Suffix branch: noisy action tokens plus time conditioning through a Gemma action expert.
+- Joint attention: prefix and suffix are processed together layer by layer.
+- Action head: the suffix hidden states are projected back to continuous actions.
+
+Unlike upstream PI05, the pi0_v3 implementation overrides the joint-attention path so attention heads are inferred dynamically from the actual variant instead of assuming 8 heads. That is what makes the `gemma_tiny` smoke variant work.
+
+### Supported Backbone Variants
+
+`paligemma_variant` and `action_expert_variant` can be chosen independently from:
+
+| Variant | Hidden width | Layers | Attention heads | Head dim | MLP dim |
+| ------- | ------------ | ------ | --------------- | -------- | ------- |
+| `gemma_tiny` | 256 | 4 | 4 | 64 | 1024 |
+| `gemma_300m` | 1024 | 18 | 8 | 256 | 4096 |
+| `gemma_2b` | 2048 | 18 | 8 | 256 | 16384 |
+
+In the default large setting, pi0_v3 follows the same PI05 family scale. In the smoke-tested tiny setting, both branches use `gemma_tiny` to make CPU validation practical.
+
+## Memory Design
+
+The memory path is a hybrid of two mechanisms:
+
+1. Recent temporal tokens:
+   - preserve the last few encoded history steps without compression
+   - injected back into the prefix as extra memory tokens
+
+2. Slot memory bank:
+   - writes history summaries into a fixed number of slots
+   - reads top-k slots with a learned query built from the current prefix summary and current state
+   - returns both prefix-side tokens and suffix-side context
+
+This gives pi0_v3 two complementary behaviors:
+
+- very recent information stays high fidelity
+- older information is compressed into reusable memory slots
+
+### Memory Data Flow
+
+The full memory path is:
+
+1. Processor split
+
+   The policy preprocessor keeps the newest observation as the main observation and places temporal context into dedicated memory keys.
+
+2. History encoding
+
+   Each history step is built from five sources:
+
+   - pooled image history embedding
+   - current state vector for that step
+   - state delta relative to the previous step
+   - aligned action history for that step
+   - broadcast task summary from language tokens
+
+   These five features are fused and passed through a causal temporal transformer.
+
+3. Recent-token extraction
+
+   The last `memory_recent_tokens` valid temporal states are gathered directly from the encoded history. They become:
+
+   - recent prefix memory tokens
+   - a recent summary vector for suffix conditioning
+   - a recent future-action auxiliary prediction
+
+4. Sequence slot rollout
+
+   The encoded history is also written step by step into a `HybridSlotMemoryBank`.
+
+   For each valid step, the bank computes:
+
+   - a normalized write key
+   - a write value
+   - optional phase-codebook assignment
+
+   It either updates the best matching slot or fills an empty slot, using EMA updates and a small forget bias.
+
+5. Slot read
+
+   A read query is built from:
+
+   - the pooled current prefix summary
+   - the current robot state
+
+   Top-k slots are read and converted into:
+
+   - slot memory tokens for the prefix
+   - slot context for the suffix AdaRMS path
+   - an auxiliary future-action prediction
+   - a sparsity regularizer based on read entropy
+
+6. Hybrid merge
+
+   The model merges recent context and slot context with a learned gate:
+
+   - `memory_tokens = [recent_tokens, slot_tokens]`
+   - `memory_context = gate * slot_context + (1 - gate) * recent_context`
+
+7. Injection into the main model
+
+   - `memory_tokens` are appended to the prefix token sequence.
+   - `memory_context` is added to the suffix AdaRMS conditioning path.
+
+8. Auxiliary losses
+
+   During training, the policy can add memory-specific auxiliary losses:
+
+   - future action loss
+   - read sparsity loss
+   - vector-quantization loss
+   - contrastive query/write-key loss
+
+## Online Cache Behavior During Rollout
+
+pi0_v3 keeps two online memory layers during environment interaction.
+
+### Layer 1: Deque-based observation and action history
+
+At policy reset, the following caches are cleared:
+
+- state history deque
+- per-camera image history deque
+- action history deque
+- slot memory online state
+
+During rollout:
+
+- `predict_action_chunk()` and `select_action()` first append the current state and current image(s) to the deques.
+- If batch size changes, the policy resets these buffers automatically.
+- `select_action()` appends only executed actions to the action-history deque, after popping them from the internal action queue.
+
+This means the temporal transformer always sees the actual rollout history, not an offline replay artifact.
+
+### Layer 2: Online slot memory state
+
+When `memory_online_enabled=true`, the policy also keeps a persistent slot-memory state across rollout steps.
+
+The inference loop is:
+
+1. Build the current temporal window from the deques.
+2. Read the persistent slot memory with the current query.
+3. Merge the online slot read with the freshly encoded sequence memory.
+4. Denoise the action chunk.
+5. After sampling, write a new online memory update using:
+   - the current memory write summary
+   - the current state
+   - the mean predicted action chunk as action summary
+
+So the rollout memory is not just a sliding window. It is a sliding window plus a persistent slot bank that accumulates compressed past context.
+
+## Key Configuration Knobs
+
+| Parameter | Meaning |
+| --------- | ------- |
+| `memory_sequence_lookback` | Number of observation steps available to memory |
+| `memory_recent_tokens` | Number of high-fidelity recent temporal tokens kept explicitly |
+| `memory_slots` | Number of persistent memory slots |
+| `memory_topk` | Number of slots retrieved at read time |
+| `memory_token_count` | Number of slot-derived prefix tokens returned by the bank |
+| `memory_temporal_layers` | Number of temporal-transformer layers over history |
+| `memory_temporal_heads` | Number of attention heads in the temporal transformer |
+| `memory_use_action_history` | Whether past actions are fused into memory encoding |
+| `memory_use_image_history` | Whether past images are fused into memory encoding |
+| `memory_online_enabled` | Whether online slot memory persists across rollout steps |
+
+The total prefix-side memory token count is:
+
+```python
+total_memory_token_count = memory_recent_tokens + memory_token_count
+```
+
+## Training And Evaluation Commands
+
+### Smoke Recipe Validated In This Workspace
+
+This is the exact MetaWorld smoke flow that was executed successfully.
+
+#### 1. Generate a tiny local MetaWorld dataset
+
+```bash
+MUJOCO_GL=egl python examples/metaworld/generate_smoke_dataset.py \
+  --task metaworld-push-v3 \
+  --repo-id local/metaworld_pi0_v3_smoke \
+  --root outputs/datasets/metaworld_pi0_v3_smoke \
+  --episodes 2 \
+  --max-steps 8 \
+  --overwrite
+```
+
+#### 2. Run one-step training smoke
+
+```bash
+MUJOCO_GL=egl python -m lerobot.scripts.lerobot_train \
+  --policy.type=pi0_v3 \
+  --policy.device=cpu \
+  --policy.push_to_hub=false \
+  --policy.paligemma_variant=gemma_tiny \
+  --policy.action_expert_variant=gemma_tiny \
+  --policy.image_resolution=[32,32] \
+  --policy.tokenizer_max_length=32 \
+  --policy.chunk_size=4 \
+  --policy.n_action_steps=2 \
+  --policy.max_state_dim=4 \
+  --policy.max_action_dim=4 \
+  --policy.memory_sequence_lookback=3 \
+  --policy.memory_recent_tokens=2 \
+  --policy.memory_temporal_layers=1 \
+  --policy.memory_temporal_heads=4 \
+  --dataset.repo_id=local/metaworld_pi0_v3_smoke \
+  --dataset.root=outputs/datasets/metaworld_pi0_v3_smoke \
+  --dataset.episodes=[0,1] \
+  --batch_size=1 \
+  --steps=1 \
+  --save_freq=1 \
+  --log_freq=1 \
+  --eval_freq=-1 \
+  --num_workers=0 \
+  --wandb.enable=false \
+  --output_dir=outputs/train/pi0_v3_metaworld_smoke
+```
+
+This produces a reloadable checkpoint under:
+
+```text
+outputs/train/pi0_v3_metaworld_smoke/checkpoints/last/pretrained_model
+```
+
+#### 3. Run one-episode MetaWorld evaluation smoke
+
+```bash
+MUJOCO_GL=egl python -m lerobot.scripts.lerobot_eval \
+  --policy.path=outputs/train/pi0_v3_metaworld_smoke/checkpoints/last/pretrained_model \
+  --policy.device=cpu \
+  --env.type=metaworld \
+  --env.task=metaworld-push-v3 \
+  --env.obs_type=pixels_agent_pos \
+  --eval.n_episodes=1 \
+  --eval.batch_size=1 \
+  --output_dir=outputs/eval/pi0_v3_metaworld_smoke
+```
+
+### Train pi0_v3 On Your Own Dataset
+
+For a normal training run on a converted LeRobot dataset:
+
+```bash
+lerobot-train \
+  --dataset.repo_id=your_dataset \
+  --dataset.root=/path/to/your_dataset \
+  --policy.type=pi0_v3 \
+  --policy.pretrained_path=lerobot/pi05_base \
+  --policy.device=cuda \
+  --policy.dtype=bfloat16 \
+  --policy.gradient_checkpointing=true \
+  --policy.chunk_size=50 \
+  --policy.n_action_steps=50 \
+  --policy.memory_sequence_lookback=4 \
+  --policy.memory_recent_tokens=4 \
+  --policy.memory_slots=4 \
+  --policy.memory_topk=2 \
+  --batch_size=8 \
+  --steps=100000 \
+  --output_dir=outputs/train/pi0_v3_run
+```
+
+Notes:
+
+- `policy.pretrained_path` is optional if you want to initialize from a fresh config, but starting from PI05 weights is the most practical path.
+- If your dataset already provides temporal windows, pi0_v3 will use them through the policy config's delta-index hooks.
+- If `chunk_size` is reduced for smoke or debugging, the config auto-clamps the default `n_action_steps` to avoid an invalid setup.
+
+### Evaluate A Trained pi0_v3 Checkpoint
+
+```bash
+lerobot-eval \
+  --policy.path=outputs/train/pi0_v3_run/checkpoints/last/pretrained_model \
+  --policy.device=cuda \
+  --env.type=metaworld \
+  --env.task=metaworld-push-v3 \
+  --env.obs_type=pixels_agent_pos \
+  --eval.n_episodes=10 \
+  --eval.batch_size=1 \
+  --output_dir=outputs/eval/pi0_v3_run
+```
+
+If you use another simulator, the policy side does not change. Only `env.*` and any required `rename_map` settings change.
+
+## Implementation Pointers
+
+- Config: `src/lerobot/policies/pi0-v3/configuration_pi0_v3.py`
+- Memory bank: `src/lerobot/policies/pi0-v3/memory_pi0_v3.py`
+- Model: `src/lerobot/policies/pi0-v3/modeling_pi0_v3.py`
+- Processor: `src/lerobot/policies/pi0-v3/processor_pi0_v3.py`
+- Tests: `tests/policies/pi0_v3/test_pi0_v3.py`

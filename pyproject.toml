@@ -176,6 +176,11 @@ aloha = ["gym-aloha>=0.1.2,<0.2.0", "lerobot[scipy-dep]"]
 pusht = ["gym-pusht>=0.1.5,<0.2.0", "pymunk>=6.6.0,<7.0.0"] # TODO: Fix pymunk version in gym-pusht instead
 libero = ["lerobot[transformers-dep]", "hf-libero>=0.1.3,<0.2.0; sys_platform == 'linux'", "lerobot[scipy-dep]"]
 metaworld = ["metaworld==3.0.0", "lerobot[scipy-dep]"]
+robomme = [
+    "lerobot[pi]",
+    "h5py>=3.11.0,<4.0.0",
+    "robomme @ git+https://github.com/RoboMME/robomme_benchmark.git@main",
+]
 
 # All
 all = [
@@ -206,6 +211,7 @@ all = [
     "lerobot[phone]",
     "lerobot[libero]; sys_platform == 'linux'",
     "lerobot[metaworld]",
+    "lerobot[robomme]",
     "lerobot[sarm]",
     "lerobot[peft]",
     # "lerobot[unitree_g1]", TODO: Unitree requires specific installation instructions for unitree_sdk2
@@ -213,6 +219,7 @@ all = [
 
 [project.scripts]
 lerobot-calibrate="lerobot.scripts.lerobot_calibrate:main"
+lerobot-convert-robomme="lerobot.scripts.convert_robomme_h5_to_lerobot:main"
 lerobot-find-cameras="lerobot.scripts.lerobot_find_cameras:main"
 lerobot-find-port="lerobot.scripts.lerobot_find_port:main"
 lerobot-record="lerobot.scripts.lerobot_record:main"

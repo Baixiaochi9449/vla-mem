@@ -83,7 +83,7 @@ class TrainPipelineConfig(HubMixin):
 
     def validate(self) -> None:
         # HACK: We parse again the cli args here to get the pretrained paths if there was some.
-        policy_path = parser.get_path_arg("policy")
+        policy_path = parser.get_path_arg("policy") or parser.get_pretrained_path_arg("policy")
         if policy_path:
             # Only load the policy config
             cli_overrides = parser.get_cli_overrides("policy")
@@ -110,7 +110,7 @@ class TrainPipelineConfig(HubMixin):
 
         if self.policy is None:
             raise ValueError(
-                "Policy is not configured. Please specify a pretrained policy with `--policy.path`."
+                "Policy is not configured. Please specify a pretrained policy with `--policy.path` or `--policy.pretrained_path`."
             )
 
         if not self.job_name:

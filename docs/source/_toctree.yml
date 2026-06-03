@@ -45,6 +45,8 @@
     title: π₀-FAST (Pi0Fast)
   - local: pi05
     title: π₀.₅ (Pi05)
+  - local: pi0_v3
+    title: π₀-V3 (Pi0V3)
   - local: groot
     title: NVIDIA GR00T N1.5
   - local: xvla
@@ -73,6 +75,8 @@
     title: NVIDIA IsaacLab Arena Environments
   - local: libero
     title: Using Libero
+  - local: robomme
+    title: Using RoboMME
   - local: metaworld
     title: Using MetaWorld
   title: "Simulation"

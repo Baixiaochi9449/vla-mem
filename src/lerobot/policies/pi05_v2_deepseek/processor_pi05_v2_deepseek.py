@@ -1,6 +1,9 @@
 #!/usr/bin/env python
 
 from __future__ import annotations
+import os
+_PALIGEMMA_TOKENIZER_NAME = os.environ.get("PALIGEMMA_TOKENIZER_PATH", "google/paligemma-3b-pt-224")
+
 
 from copy import deepcopy
 from dataclasses import dataclass
@@ -200,7 +203,7 @@ def make_pi05_v2_deepseek_pre_post_processors(
             max_cameras=config.memory_max_cameras,
         ),
         TokenizerProcessorStep(
-            tokenizer_name="google/paligemma-3b-pt-224",
+            tokenizer_name=_PALIGEMMA_TOKENIZER_NAME,
             max_length=config.tokenizer_max_length,
             padding_side="right",
             padding="max_length",
