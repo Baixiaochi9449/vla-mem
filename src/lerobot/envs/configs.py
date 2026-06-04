@@ -450,6 +450,65 @@ class RobommeEnv(EnvConfig):
         return kwargs
 
 
+@EnvConfig.register_subclass("robomme_raw")
+@dataclass
+class RobommeRawEnv(EnvConfig):
+    """RoboMME env config using the raw ManiSkill3 env (no mplib / DemonstrationWrapper).
+
+    Use this instead of ``RobommeEnv`` on servers where mplib is unavailable or
+    segfaults.  The env wrapper accepts absolute ee_pose actions and converts them
+    to delta actions internally.
+    """
+
+    task: str = "all"
+    split: str = "test"
+    fps: int = 30
+    episode_length: int = 1300
+    observation_height: int = 256
+    observation_width: int = 256
+    episode_indices: list[int] | None = None
+    features: dict[str, PolicyFeature] = field(default_factory=dict)
+    features_map: dict[str, str] = field(
+        default_factory=lambda: {
+            ACTION: ACTION,
+            "agent_pos": OBS_STATE,
+            "pixels/image": f"{OBS_IMAGES}.image",
+            "pixels/image2": f"{OBS_IMAGES}.image2",
+        }
+    )
+
+    def __post_init__(self):
+        normalize_robomme_task_names(self.task)
+        if self.split not in ROBOMME_SPLITS:
+            raise ValueError(f"Unsupported split: {self.split!r}. Expected one of {ROBOMME_SPLITS}.")
+
+        self.features[ACTION] = PolicyFeature(
+            type=FeatureType.ACTION,
+            shape=(ROBOMME_ACTION_SPACE_SHAPES["ee_pose"],),  # always 7-D absolute ee_pose
+        )
+        self.features["agent_pos"] = PolicyFeature(type=FeatureType.STATE, shape=(8,))
+        self.features["pixels/image"] = PolicyFeature(
+            type=FeatureType.VISUAL,
+            shape=(self.observation_height, self.observation_width, 3),
+        )
+        self.features["pixels/image2"] = PolicyFeature(
+            type=FeatureType.VISUAL,
+            shape=(self.observation_height, self.observation_width, 3),
+        )
+
+    @property
+    def gym_kwargs(self) -> dict:
+        kwargs: dict[str, Any] = {
+            "split": self.split,
+            "episode_length": self.episode_length,
+            "observation_height": self.observation_height,
+            "observation_width": self.observation_width,
+        }
+        if self.episode_indices is not None:
+            kwargs["episode_indices"] = self.episode_indices
+        return kwargs
+
+
 @EnvConfig.register_subclass("isaaclab_arena")
 @dataclass
 class IsaaclabArenaEnv(HubEnvConfig):
