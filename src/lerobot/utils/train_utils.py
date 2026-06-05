@@ -56,10 +56,21 @@ def load_training_step(save_dir: Path) -> int:
 
 def update_last_checkpoint(checkpoint_dir: Path) -> Path:
     last_checkpoint_dir = checkpoint_dir.parent / LAST_CHECKPOINT_LINK
+    relative_target = checkpoint_dir.relative_to(checkpoint_dir.parent)
+    # Try symlink first; fall back to a plain text file on filesystems that do
+    # not support symlinks (e.g. NTFS, exFAT, some NFS mounts – Errno 95).
     if last_checkpoint_dir.is_symlink():
         last_checkpoint_dir.unlink()
-    relative_target = checkpoint_dir.relative_to(checkpoint_dir.parent)
-    last_checkpoint_dir.symlink_to(relative_target)
+    elif last_checkpoint_dir.is_dir():
+        # Previous fallback: a directory named "last" that was a copied checkpoint.
+        # Leave it; it will be overwritten below as a file instead.
+        pass
+    try:
+        last_checkpoint_dir.symlink_to(relative_target)
+    except OSError:
+        # Symlink not supported – write the target name into a plain text file.
+        last_checkpoint_dir_txt = checkpoint_dir.parent / (LAST_CHECKPOINT_LINK + ".txt")
+        last_checkpoint_dir_txt.write_text(str(relative_target))
 
 
 def save_checkpoint(

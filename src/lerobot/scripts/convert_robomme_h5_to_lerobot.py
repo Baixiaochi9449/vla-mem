@@ -56,6 +56,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-episodes-per-task", type=int, default=None)
     parser.add_argument("--download-missing", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--with-subtasks",
+        action="store_true",
+        help="Include subtask annotation fields (simple_subgoal, grounded_subgoal, "
+             "simple_subgoal_online, grounded_subgoal_online, is_subgoal_boundary) "
+             "as extra columns in the parquet files. These fields are skipped by the "
+             "LeRobot training pipeline and do not affect policy learning.",
+    )
     parser.add_argument("--quiet", action="store_true")
     return parser.parse_args()
 
@@ -193,9 +201,10 @@ def _ensure_raw_h5_files(raw_dir: Path, tasks: list[str], download_missing: bool
             _extract_raw_h5_archive(archive_path, h5_path)
 
 
-def _build_features(action_space: str) -> dict[str, dict[str, Any]]:
-    action_dim = ROBOMME_ACTION_SPACE_SHAPES[action_space]
-    return {
+def _build_features(action_space: str, with_subtasks: bool = False) -> dict[str, dict[str, Any]]:
+    raw_shape = ROBOMME_ACTION_SPACE_SHAPES[action_space]
+    action_dim = raw_shape[0] if isinstance(raw_shape, (tuple, list)) else int(raw_shape)
+    features: dict[str, dict[str, Any]] = {
         f"{OBS_IMAGES}.image": {
             "dtype": "image",
             "shape": (256, 256, 3),
@@ -226,6 +235,13 @@ def _build_features(action_space: str) -> dict[str, dict[str, Any]]:
             "names": [f"action_{index}" for index in range(action_dim)],
         },
     }
+    if with_subtasks:
+        features["simple_subgoal"] = {"dtype": "string", "shape": (1,), "names": None}
+        features["grounded_subgoal"] = {"dtype": "string", "shape": (1,), "names": None}
+        features["simple_subgoal_online"] = {"dtype": "string", "shape": (1,), "names": None}
+        features["grounded_subgoal_online"] = {"dtype": "string", "shape": (1,), "names": None}
+        features["is_subgoal_boundary"] = {"dtype": "bool", "shape": (1,), "names": None}
+    return features
 
 
 def _resolve_output_root(output_root: Path | None, action_space: str, split: str, multi_split: bool) -> Path:
@@ -279,12 +295,54 @@ def _extract_task_prompt(setup_group: Any, fallback_task: str) -> str:
     return fallback_task
 
 
-def _iter_execution_frames(episode_group: Any, action_space: str, task_prompt: str):
+def _resolve_subgoal_text(raw: Any, last_known: str | None) -> str:
+    """Decode a raw HDF5 subgoal value and fall back to the last-known non-sentinel text.
+
+    A subgoal whose decoded text contains 'complete' or 'done' is treated as a
+    terminal sentinel and replaced with the previous valid subgoal.
+    """
+    text = _decode_scalar(raw)
+    if isinstance(text, list):
+        text = text[0] if text else ""
+    if not isinstance(text, str):
+        text = str(text)
+    # sentinel heuristic: the official code uses 'complete' as a terminal marker
+    if last_known is not None and any(kw in text.lower() for kw in ("complete", "done", "finished", "task complete")):
+        return last_known
+    return text
+
+
+def _iter_execution_frames(
+    episode_group: Any,
+    action_space: str,
+    task_prompt: str,
+    with_subtasks: bool = False,
+):
     action_key = "eef_action" if action_space == "ee_pose" else "joint_action"
+    last_simple_subgoal: str | None = None
+    last_grounded_subgoal: str | None = None
+
     for timestep_name in _sorted_timestep_names(episode_group):
         timestep_group = episode_group[timestep_name]
         info_group = timestep_group["info"]
         is_video_demo = bool(np.asarray(info_group["is_video_demo"][()]).item())
+
+        if with_subtasks and is_video_demo:
+            # Still track the running subgoal state from demo frames so that
+            # the first execution frame picks up the correct context.
+            if "is_completed" in info_group:
+                is_completed = bool(np.asarray(info_group["is_completed"][()]).item())
+            else:
+                is_completed = False
+            if not is_completed and "simple_subgoal" in info_group:
+                candidate = _resolve_subgoal_text(info_group["simple_subgoal"][()], last_simple_subgoal)
+                if candidate:
+                    last_simple_subgoal = candidate
+                candidate_g = _resolve_subgoal_text(info_group["grounded_subgoal"][()], last_grounded_subgoal)
+                if candidate_g:
+                    last_grounded_subgoal = candidate_g
+            continue
+
         if is_video_demo:
             continue
 
@@ -292,13 +350,56 @@ def _iter_execution_frames(episode_group: Any, action_space: str, task_prompt: s
         action_group = timestep_group["action"]
         eef_state = np.asarray(obs_group["eef_state"][()], dtype=np.float32).reshape(-1)
         gripper_state = np.asarray(obs_group["gripper_state"][()], dtype=np.float32).reshape(-1)
-        yield {
+        frame = {
             f"{OBS_IMAGES}.image": np.asarray(obs_group["front_rgb"][()], dtype=np.uint8),
             f"{OBS_IMAGES}.image2": np.asarray(obs_group["wrist_rgb"][()], dtype=np.uint8),
             OBS_STATE: np.concatenate((eef_state, gripper_state), axis=0).astype(np.float32, copy=False),
             ACTION: np.asarray(action_group[action_key][()], dtype=np.float32).reshape(-1),
             "task": task_prompt,
         }
+
+        if with_subtasks:
+            if "is_completed" in info_group:
+                is_completed = bool(np.asarray(info_group["is_completed"][()]).item())
+            else:
+                is_completed = False
+
+            if "is_subgoal_boundary" in info_group:
+                is_subgoal_boundary = bool(np.asarray(info_group["is_subgoal_boundary"][()]).item())
+            else:
+                is_subgoal_boundary = False
+
+            if not is_completed and "simple_subgoal" in info_group:
+                simple_subgoal = _resolve_subgoal_text(
+                    info_group["simple_subgoal"][()], last_simple_subgoal
+                )
+                grounded_subgoal = _resolve_subgoal_text(
+                    info_group["grounded_subgoal"][()], last_grounded_subgoal
+                )
+                simple_subgoal_online = _resolve_subgoal_text(
+                    info_group["simple_subgoal_online"][()], last_simple_subgoal
+                )
+                grounded_subgoal_online = _resolve_subgoal_text(
+                    info_group["grounded_subgoal_online"][()], last_grounded_subgoal
+                )
+                if simple_subgoal:
+                    last_simple_subgoal = simple_subgoal
+                if grounded_subgoal:
+                    last_grounded_subgoal = grounded_subgoal
+            else:
+                # Terminal / completed frame — use last known subgoal text
+                simple_subgoal = last_simple_subgoal or ""
+                grounded_subgoal = last_grounded_subgoal or ""
+                simple_subgoal_online = simple_subgoal
+                grounded_subgoal_online = grounded_subgoal
+
+            frame["simple_subgoal"] = simple_subgoal
+            frame["grounded_subgoal"] = grounded_subgoal
+            frame["simple_subgoal_online"] = simple_subgoal_online
+            frame["grounded_subgoal_online"] = grounded_subgoal_online
+            frame["is_subgoal_boundary"] = np.array([is_subgoal_boundary], dtype=np.bool_)
+
+        yield frame
 
 
 def convert_robomme_h5_to_lerobot(
@@ -312,6 +413,7 @@ def convert_robomme_h5_to_lerobot(
     max_episodes_per_task: int | None,
     download_missing: bool = False,
     overwrite: bool = False,
+    with_subtasks: bool = False,
 ) -> list[tuple[str, Path]]:
     import h5py
 
@@ -336,7 +438,7 @@ def convert_robomme_h5_to_lerobot(
             repo_id=split_repo_id,
             root=split_output_root,
             fps=ROBOMME_FPS,
-            features=_build_features(action_space),
+            features=_build_features(action_space, with_subtasks=with_subtasks),
             use_videos=False,
         )
 
@@ -356,7 +458,9 @@ def convert_robomme_h5_to_lerobot(
                         task_prompt = _extract_task_prompt(episode_group["setup"], task_name)
 
                         frame_count = 0
-                        for frame in _iter_execution_frames(episode_group, action_space, task_prompt):
+                        for frame in _iter_execution_frames(
+                            episode_group, action_space, task_prompt, with_subtasks=with_subtasks
+                        ):
                             dataset.add_frame(frame)
                             frame_count += 1
 
@@ -398,6 +502,7 @@ def main() -> None:
         max_episodes_per_task=args.max_episodes_per_task,
         download_missing=args.download_missing,
         overwrite=args.overwrite,
+        with_subtasks=args.with_subtasks,
     )
     for resolved_repo_id, resolved_root in outputs:
         print(f"repo_id={resolved_repo_id}")

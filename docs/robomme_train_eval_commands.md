@@ -38,27 +38,27 @@ export XDG_RUNTIME_DIR=/tmp/runtime-root
 
 ```bash
 cd /home/lq/VLA/lerobot
-
-CUDA_VISIBLE_DEVICES=0 \
+CUDA_VISIBLE_DEVICES=1
+CUDA_VISIBLE_DEVICES=1 \
 PALIGEMMA_TOKENIZER_PATH=outputs/pretrained/paligemma_tokenizer \
 HF_HUB_OFFLINE=1 \
 .venv/bin/lerobot-train \
-    --policy.type=pi05 \
     --policy.pretrained_path=outputs/pretrained/pi05_base \
+    --policy.push_to_hub=false \
     --policy.paligemma_variant=gemma_2b \
     --policy.action_expert_variant=gemma_300m \
     --policy.dtype=bfloat16 \
     --policy.chunk_size=50 \
     --policy.n_action_steps=50 \
-    --policy.normalization_mapping.VISUAL=IDENTITY \
-    --policy.normalization_mapping.STATE=QUANTILES \
-    --policy.normalization_mapping.ACTION=QUANTILES \
     --dataset.repo_id=robomme_ee_pose_train \
-    --dataset.root=outputs/datasets/robomme_ee_pose_train \
-    --training.num_workers=4 \
-    --training.batch_size=32 \
-    --training.num_epochs=50 \
-    --output_dir=outputs/train/pi05_robomme
+    --dataset.root=/home/Dataset/Dataset/RoboMME/robomme_ee_pose_train \
+    --num_workers=4 \
+    --batch_size=16 \
+    --steps=100000 \
+    --save_freq=5000 \
+    --eval_freq=5000 \
+    --output_dir=outputs/train/pi05_robomme \
+    --wandb.enable=true
 ```
 
 ### 评估（单任务）
@@ -117,21 +117,20 @@ CUDA_VISIBLE_DEVICES=0 \
 PALIGEMMA_TOKENIZER_PATH=outputs/pretrained/paligemma_tokenizer \
 HF_HUB_OFFLINE=1 \
 .venv/bin/lerobot-train \
-    --policy.type=pi05_v1 \
     --policy.pretrained_path=outputs/pretrained/pi05_base \
+    --policy.push_to_hub=false \
     --policy.paligemma_variant=gemma_2b \
     --policy.action_expert_variant=gemma_300m \
     --policy.dtype=bfloat16 \
     --policy.chunk_size=50 \
     --policy.n_action_steps=50 \
-    --policy.normalization_mapping.VISUAL=IDENTITY \
-    --policy.normalization_mapping.STATE=QUANTILES \
-    --policy.normalization_mapping.ACTION=QUANTILES \
     --dataset.repo_id=robomme_ee_pose_train \
     --dataset.root=outputs/datasets/robomme_ee_pose_train \
-    --training.num_workers=4 \
-    --training.batch_size=32 \
-    --training.num_epochs=50 \
+    --num_workers=4 \
+    --batch_size=16 \
+    --steps=50000 \
+    --save_freq=5000 \
+    --eval_freq=5000 \
     --output_dir=outputs/train/pi05_v1_robomme
 ```
 
@@ -170,19 +169,18 @@ cd /home/lq/VLA/lerobot
 CUDA_VISIBLE_DEVICES=0 \
 HF_HUB_OFFLINE=1 \
 .venv/bin/lerobot-train \
-    --policy.type=pi05_v2_deepseek \
     --policy.pretrained_path=outputs/pretrained/pi05_v2_deepseek_base \
+    --policy.push_to_hub=false \
     --policy.dtype=bfloat16 \
     --policy.chunk_size=50 \
     --policy.n_action_steps=50 \
-    --policy.normalization_mapping.VISUAL=IDENTITY \
-    --policy.normalization_mapping.STATE=QUANTILES \
-    --policy.normalization_mapping.ACTION=QUANTILES \
     --dataset.repo_id=robomme_ee_pose_train \
     --dataset.root=outputs/datasets/robomme_ee_pose_train \
-    --training.num_workers=4 \
-    --training.batch_size=32 \
-    --training.num_epochs=50 \
+    --num_workers=4 \
+    --batch_size=16 \
+    --steps=50000 \
+    --save_freq=5000 \
+    --eval_freq=5000 \
     --output_dir=outputs/train/pi05_v2_deepseek_robomme
 ```
 
@@ -246,7 +244,7 @@ torchrun --nproc_per_node=2 \
 ### 从 checkpoint 恢复训练
 
 ```bash
---training.resume=true \
+--resume=true \
 --output_dir=outputs/train/pi05_robomme  # 指向已有输出目录
 ```
 
