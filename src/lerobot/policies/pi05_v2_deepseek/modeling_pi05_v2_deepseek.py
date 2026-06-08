@@ -185,7 +185,83 @@ class PI05V2DeepseekPolicy(PI05Policy):
         if config.gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
         self.model.to(config.device)
+
+        # Optionally load pi05 backbone weights from a separate pretrained pi05 checkpoint.
+        # The new memory encoder + dynamic LoRA hypernet are not present in that checkpoint,
+        # so they remain randomly initialized.  We rely on strict=False to silently accept
+        # those missing keys.
+        if config.pi05_base_path:
+            self._load_pi05_base_weights(config.pi05_base_path)
+
         self.reset()
+
+    def _load_pi05_base_weights(self, pi05_base_path: str) -> None:
+        """Load pi05 backbone weights from a pretrained pi05 checkpoint directory.
+
+        The memory encoder and dynamic LoRA hypernet are new modules that do not exist in
+        the pi05 checkpoint, so they will be listed as missing keys and stay randomly
+        initialized.  The DynamicLoRALinear wrappers copy their base weights from the
+        original linear layers during construction, so any pi05 expert-attention weights
+        that were loaded will be reflected there automatically.
+        """
+        import logging
+        from pathlib import Path
+
+        from safetensors.torch import load_file
+        from transformers.utils import cached_file
+
+        logger = logging.getLogger(__name__)
+        logger.info(f"[pi05_v2_deepseek] Loading pi05 base weights from: {pi05_base_path}")
+
+        try:
+            resolved = cached_file(
+                pi05_base_path,
+                "model.safetensors",
+                local_files_only=True,
+            )
+            raw_state_dict = load_file(resolved)
+        except Exception as exc:
+            logger.warning(
+                f"[pi05_v2_deepseek] Could not load pi05 base weights from '{pi05_base_path}': {exc}. "
+                "Continuing with random initialization."
+            )
+            return
+
+        # Reuse PI05Policy's key-remap helper so old-format keys are normalised.
+        fixed = self._fix_pytorch_state_dict_keys(raw_state_dict, self.config)
+
+        # Add "model." prefix when missing (same convention as PI05Policy.from_pretrained).
+        remapped = {}
+        for k, v in fixed.items():
+            remapped[k if k.startswith("model.") else f"model.{k}"] = v
+
+        # strict=False: new modules (memory_encoder, dynamic_lora_hypernet, LoRA wrappers)
+        # will show up as missing keys; that is expected and intentional.
+        missing, unexpected = self.load_state_dict(remapped, strict=False)
+
+        new_module_prefixes = (
+            "model.memory_encoder.",
+            "model.dynamic_lora_hypernet.",
+        )
+        # Keys that belong to the new modules are expected missing – filter them out for the log.
+        truly_missing = [k for k in missing if not any(k.startswith(p) for p in new_module_prefixes)]
+
+        logger.info(
+            f"[pi05_v2_deepseek] Loaded pi05 base weights. "
+            f"Missing (non-new-module) keys: {len(truly_missing)}, "
+            f"Unexpected keys: {len(unexpected)}, "
+            f"New-module keys (randomly initialised): {len(missing) - len(truly_missing)}"
+        )
+        if truly_missing:
+            for k in truly_missing[:10]:
+                logger.warning(f"  missing: {k}")
+            if len(truly_missing) > 10:
+                logger.warning(f"  ... and {len(truly_missing) - 10} more")
+        if unexpected:
+            for k in unexpected[:10]:
+                logger.warning(f"  unexpected: {k}")
+            if len(unexpected) > 10:
+                logger.warning(f"  ... and {len(unexpected) - 10} more")
 
     def reset(self):
         self._action_queue = deque(maxlen=self.config.n_action_steps)

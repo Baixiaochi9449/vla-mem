@@ -109,11 +109,18 @@ def _eef_state(raw_env) -> np.ndarray:
 
     SAPIEN Pose convention: ``tcp_pose.raw_pose[0]`` = ``[x, y, z, qw, qx, qy, qz]``
     scipy ``Rotation.from_quat`` expects                              ``[qx, qy, qz, qw]``
+
+    RPY angles near -π are mapped to their +π equivalent to match the training
+    dataset convention (eef_action in the HDF5 recordings always uses +π for the
+    robot's nominal roll-≈π posture, and the conversion script aligns eef_state
+    to the same branch).
     """
     raw = raw_env.unwrapped.agent.tcp_pose.raw_pose[0].cpu().numpy()
     qwxyz = raw[3:]  # [qw, qx, qy, qz]
     r = Rotation.from_quat([qwxyz[1], qwxyz[2], qwxyz[3], qwxyz[0]])
     rpy = r.as_euler("xyz", degrees=False).astype(np.float32)
+    # Align angles near -π to +π to be consistent with training data convention.
+    rpy = np.where(rpy < -np.pi + 0.15, rpy + 2.0 * np.pi, rpy)
     return np.concatenate([raw[:3].astype(np.float32), rpy])  # (6,)
 
 

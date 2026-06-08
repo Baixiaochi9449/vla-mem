@@ -199,5 +199,15 @@ class WandBLogger:
         if mode not in {"train", "eval"}:
             raise ValueError(mode)
 
-        wandb_video = self._wandb.Video(video_path, fps=self.env_fps, format="mp4")
-        self._wandb.log({f"{mode}/video": wandb_video}, step=step)
+        try:
+            wandb_video = self._wandb.Video(video_path, fps=self.env_fps, format="mp4")
+            self._wandb.log({f"{mode}/video": wandb_video}, step=step)
+        except (PermissionError, OSError) as e:
+            # Some filesystems (NAS/NTFS/exFAT) do not support chmod; wandb's
+            # shutil.copymode call then raises PermissionError (Errno 1) or
+            # OSError (Errno 95).  Skip video logging rather than crashing.
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "Skipping wandb video upload for step %s due to filesystem error: %s",
+                step, e,
+            )

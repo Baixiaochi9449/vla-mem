@@ -350,11 +350,34 @@ def _iter_execution_frames(
         action_group = timestep_group["action"]
         eef_state = np.asarray(obs_group["eef_state"][()], dtype=np.float32).reshape(-1)
         gripper_state = np.asarray(obs_group["gripper_state"][()], dtype=np.float32).reshape(-1)
+        # Align eef_state RPY angles to match eef_action convention.
+        # The HDF5 recorder uses sign-tracking continuity for eef_state, which can
+        # yield roll ≈ -π when the physical angle is actually ≈ +π (quaternion double-cover).
+        # eef_action is computed independently and consistently yields roll ≈ +π.
+        # robomme_raw.py._eef_state() (used at eval time) also yields +π for this pose.
+        # Solution: map angles near -π to their equivalent +π value so that
+        # training obs and eval obs are consistent, and obs/action pair in the same frame agree.
+        eef_state = eef_state.copy()
+        eef_state[3:6] = np.where(
+            eef_state[3:6] < -np.pi + 0.15,
+            eef_state[3:6] + 2.0 * np.pi,
+            eef_state[3:6],
+        )
+        action_raw = np.asarray(action_group[action_key][()], dtype=np.float32).reshape(-1)
+        # Apply the same canonical mapping to action angles so both obs and action
+        # use the same branch of the periodic Euler angle representation.
+        if action_raw.shape[0] >= 6:
+            action_raw = action_raw.copy()
+            action_raw[3:6] = np.where(
+                action_raw[3:6] < -np.pi + 0.15,
+                action_raw[3:6] + 2.0 * np.pi,
+                action_raw[3:6],
+            )
         frame = {
             f"{OBS_IMAGES}.image": np.asarray(obs_group["front_rgb"][()], dtype=np.uint8),
             f"{OBS_IMAGES}.image2": np.asarray(obs_group["wrist_rgb"][()], dtype=np.uint8),
             OBS_STATE: np.concatenate((eef_state, gripper_state), axis=0).astype(np.float32, copy=False),
-            ACTION: np.asarray(action_group[action_key][()], dtype=np.float32).reshape(-1),
+            ACTION: action_raw,
             "task": task_prompt,
         }
 

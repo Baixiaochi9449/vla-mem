@@ -27,6 +27,22 @@ class PI05V2DeepseekConfig(PI05Config):
 
     compile_model: bool = False
 
+    # Path to a pretrained pi05 checkpoint directory (pretrained_model/).
+    # When set, the pi05 backbone weights (paligemma + action expert) are loaded from this
+    # checkpoint, while the new memory encoder and dynamic LoRA hypernet are randomly
+    # initialized.  This is intentionally a separate field from `pretrained_path` so that
+    # `--policy.type=pi05_v2_deepseek` and this path can coexist on the CLI without
+    # triggering the parser's path-vs-type conflict check.
+    #
+    # Three training scenarios:
+    #   1. pi05 backbone init (recommended):
+    #        --policy.type=pi05_v2_deepseek --policy.pi05_base_path=<pi05_checkpoint>
+    #   2. fully random init (ablation):
+    #        --policy.type=pi05_v2_deepseek   (omit pi05_base_path)
+    #   3. resume from a saved pi05_v2_deepseek checkpoint:
+    #        --policy.pretrained_path=<pi05_v2_deepseek_checkpoint>  (omit type)
+    pi05_base_path: str | None = None
+
     def __post_init__(self):
         super().__post_init__()
 
