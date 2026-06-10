@@ -17,7 +17,7 @@
 import numpy as np
 
 from lerobot.envs import robomme_raw
-from lerobot.envs.configs import RobommeEnv
+from lerobot.envs.configs import RobommeEnv, RobommeRawEnv
 from lerobot.envs.factory import make_env, make_env_config
 from lerobot.envs.robomme import RobommeEpisodeEnv
 from robomme.robomme_env.utils.subgoal_evaluate_func import correct_timestep
@@ -242,6 +242,63 @@ class _FakeResetRawEnv:
 
     def close(self):
         self.closed = True
+
+
+def test_robomme_raw_config_passes_task_instruction_mode():
+    cfg = RobommeRawEnv(task="SwingXtimes", task_instruction_mode="episode")
+
+    assert cfg.gym_kwargs["task_instruction_mode"] == "episode"
+
+
+def test_robomme_raw_can_switch_policy_instruction_between_subtask_and_episode(monkeypatch):
+    created_envs = []
+
+    def fake_make(*args, **kwargs):
+        raw = _FakeResetRawEnv(len(created_envs))
+        raw.unwrapped.current_task_name_online = "online subtask instruction"
+        created_envs.append(raw)
+        return raw
+
+    monkeypatch.setattr(robomme_raw, "_ensure_robomme_env_registered", lambda: None)
+    monkeypatch.setattr(robomme_raw.gym, "make", fake_make)
+    monkeypatch.setattr(
+        robomme_raw, "_convert_obs", lambda raw_obs, raw_env: {"env_id": raw_env.env_id}
+    )
+    monkeypatch.setattr(
+        robomme_raw,
+        "_robomme_episode_task_instruction",
+        lambda raw_env, task_name: "global episode instruction",
+    )
+
+    subtask_env = robomme_raw.RobommeRawEpisodeEnv(
+        task_name="SwingXtimes",
+        split="test",
+        episode_indices=[0],
+        builder_cls=_FakeRawBuilder,
+    )
+    _, subtask_info = subtask_env.reset()
+
+    episode_env = robomme_raw.RobommeRawEpisodeEnv(
+        task_name="SwingXtimes",
+        split="test",
+        episode_indices=[0],
+        builder_cls=_FakeRawBuilder,
+        task_instruction_mode="episode",
+    )
+    _, episode_info = episode_env.reset()
+
+    assert subtask_env.task_description == "online subtask instruction"
+    assert subtask_info["task_instruction"] == "online subtask instruction"
+    assert subtask_info["episode_task_instruction"] == "global episode instruction"
+    assert subtask_info["subtask_instruction"] == "online subtask instruction"
+
+    assert episode_env.task_description == "global episode instruction"
+    assert episode_info["task_instruction"] == "global episode instruction"
+    assert episode_info["episode_task_instruction"] == "global episode instruction"
+    assert episode_info["subtask_instruction"] == "online subtask instruction"
+
+    subtask_env.close()
+    episode_env.close()
 
 
 def test_robomme_raw_reset_force_reconfigures_without_recreating_env(monkeypatch):

@@ -466,6 +466,7 @@ class RobommeRawEnv(EnvConfig):
     episode_length: int = 1300
     observation_height: int = 256
     observation_width: int = 256
+    task_instruction_mode: str = "subtask"
     episode_indices: list[int] | None = None
     features: dict[str, PolicyFeature] = field(default_factory=dict)
     features_map: dict[str, str] = field(
@@ -481,6 +482,11 @@ class RobommeRawEnv(EnvConfig):
         normalize_robomme_task_names(self.task)
         if self.split not in ROBOMME_SPLITS:
             raise ValueError(f"Unsupported split: {self.split!r}. Expected one of {ROBOMME_SPLITS}.")
+        if self.task_instruction_mode not in {"subtask", "episode"}:
+            raise ValueError(
+                "Unsupported task_instruction_mode: "
+                f"{self.task_instruction_mode!r}. Expected 'subtask' or 'episode'."
+            )
 
         self.features[ACTION] = PolicyFeature(
             type=FeatureType.ACTION,
@@ -503,6 +509,7 @@ class RobommeRawEnv(EnvConfig):
             "episode_length": self.episode_length,
             "observation_height": self.observation_height,
             "observation_width": self.observation_width,
+            "task_instruction_mode": self.task_instruction_mode,
         }
         if self.episode_indices is not None:
             kwargs["episode_indices"] = self.episode_indices

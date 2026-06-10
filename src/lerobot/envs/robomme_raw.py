@@ -340,13 +340,22 @@ class RobommeRawEpisodeEnv(gym.Env):
         observation_height: int = 256,
         observation_width: int = 256,
         builder_cls: type | None = None,
+        task_instruction_mode: str = "subtask",
     ):
         super().__init__()
         if split not in ROBOMME_SPLITS:
             raise ValueError(f"Unsupported split: {split!r}. Expected one of {ROBOMME_SPLITS}.")
 
+        if task_instruction_mode not in {"subtask", "episode"}:
+            raise ValueError(
+                "Unsupported task_instruction_mode: "
+                f"{task_instruction_mode!r}. Expected 'subtask' or 'episode'."
+            )
+
         self.task = task_name
-        self.task_description: str = task_name  # online subtask, updated after reset() / step()
+        self.task_instruction_mode = task_instruction_mode
+        self.task_description: str = task_name  # policy-facing instruction, see _update_task_description()
+        self.current_subtask_instruction: str = task_name
         self.episode_task_instruction: str = task_name  # full episode-level language goal
         self.split = split
         self.episode_length = episode_length
@@ -429,11 +438,16 @@ class RobommeRawEpisodeEnv(gym.Env):
         return self._raw_env
 
     def _update_task_description(self) -> None:
-        """Sync task_description from the live env's current_task_name_online."""
+        """Sync policy-facing task_description from the configured instruction source."""
         if self._raw_env is not None:
             live = getattr(self._raw_env.unwrapped, "current_task_name_online", None)
             if live:
-                self.task_description = live
+                self.current_subtask_instruction = live
+
+        if self.task_instruction_mode == "episode":
+            self.task_description = self.episode_task_instruction
+        else:
+            self.task_description = self.current_subtask_instruction
 
     # ------------------------------------------------------------------
     # gym.Env interface
@@ -493,6 +507,7 @@ class RobommeRawEpisodeEnv(gym.Env):
         info = {
             "task_goal": [self.task_description],
             "task_instruction": self.task_description,
+            "subtask_instruction": self.current_subtask_instruction,
             "episode_task_instruction": self.episode_task_instruction,
             "episode_index": episode_idx,
             "episode_seed": self._current_episode_seed,
@@ -547,6 +562,7 @@ class RobommeRawEpisodeEnv(gym.Env):
             "episode_index": self._current_episode_index,
             "episode_seed": self._current_episode_seed,
             "task_instruction": self.task_description,
+            "subtask_instruction": self.current_subtask_instruction,
             "episode_task_instruction": self.episode_task_instruction,
             "skipped_episode_indices": list(self._skipped_episode_indices),
             "is_success": is_success,
@@ -560,6 +576,7 @@ class RobommeRawEpisodeEnv(gym.Env):
                 "episode_index": self._current_episode_index,
                 "episode_seed": self._current_episode_seed,
                 "task_instruction": self.task_description,
+                "subtask_instruction": self.current_subtask_instruction,
                 "episode_task_instruction": self.episode_task_instruction,
                 "skipped_episode_indices": list(self._skipped_episode_indices),
                 "is_success": is_success,
@@ -607,6 +624,9 @@ class RobommeRawEpisodeEnv(gym.Env):
             "time_sec_at_30fps": self._step_index / 30.0,
             "task": self.task,
             "task_description": self.task_description,
+            "subtask_instruction": self.current_subtask_instruction,
+            "episode_task_instruction": self.episode_task_instruction,
+            "task_instruction_mode": self.task_instruction_mode,
             "target_absolute_ee_pose": target,
             "current_ee_pose_before_step": current_before,
             "desired_physical_delta_ee_pose": desired_delta,
