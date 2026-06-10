@@ -49,6 +49,7 @@ You can learn about the CLI options for this script in the `EvalPipelineConfig` 
 import concurrent.futures as cf
 import json
 import logging
+import os
 import threading
 import time
 from collections import defaultdict
@@ -91,6 +92,78 @@ from lerobot.utils.utils import (
     init_logging,
     inside_slurm,
 )
+
+
+def _jsonable_debug_value(value: Any) -> Any:
+    if isinstance(value, Tensor):
+        return value.detach().cpu().float().numpy().tolist()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, (list, tuple)):
+        return [_jsonable_debug_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _jsonable_debug_value(item) for key, item in value.items()}
+    return value
+
+
+def _append_robomme_policy_debug(
+    env: gym.vector.VectorEnv,
+    policy: PreTrainedPolicy,
+    *,
+    step: int,
+    observation: dict[str, Any],
+    raw_action: Tensor,
+    action: Tensor,
+) -> None:
+    debug_dir = os.environ.get("LEROBOT_ROBOMME_DEBUG_DIR")
+    if not debug_dir:
+        return
+
+    max_steps = int(os.environ.get("LEROBOT_ROBOMME_DEBUG_MAX_STEPS", "0") or 0)
+    if max_steps > 0 and step >= max_steps:
+        return
+
+    try:
+        episode_indices = env.call("_current_episode_index")
+    except Exception:
+        episode_indices = [None] * env.num_envs
+
+    obs_state = observation.get("observation.state")
+    tasks = observation.get("task")
+    raw_np = raw_action.detach().cpu().float().numpy()
+    action_np = action.detach().cpu().float().numpy()
+    obs_np = obs_state.detach().cpu().float().numpy() if isinstance(obs_state, Tensor) else None
+    n_action_steps = int(getattr(getattr(policy, "config", None), "n_action_steps", 1) or 1)
+
+    out_dir = Path(debug_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for batch_idx in range(env.num_envs):
+        episode_index = episode_indices[batch_idx] if batch_idx < len(episode_indices) else None
+        selected_episode = os.environ.get("LEROBOT_ROBOMME_DEBUG_EPISODE")
+        if selected_episode not in (None, "") and str(episode_index) != selected_episode:
+            continue
+
+        task = tasks[batch_idx] if isinstance(tasks, list) and batch_idx < len(tasks) else None
+        record = {
+            "source": "lerobot_eval.rollout",
+            "step": step,
+            "batch_index": batch_idx,
+            "episode_index": episode_index,
+            "time_sec_at_30fps": step / 30.0,
+            "task": task,
+            "is_chunk_boundary": step % n_action_steps == 0,
+            "raw_policy_action_normalized": raw_np[batch_idx].tolist(),
+            "postprocessed_action": action_np[batch_idx].tolist(),
+            "observation_state": obs_np[batch_idx].tolist() if obs_np is not None else None,
+            "postprocessed_action_l2": float(np.linalg.norm(action_np[batch_idx])),
+            "postprocessed_translation_l2": float(np.linalg.norm(action_np[batch_idx, :3])),
+            "postprocessed_rotation_l2": float(np.linalg.norm(action_np[batch_idx, 3:6])),
+        }
+        path = out_dir / f"eval_episode_{episode_index}_policy_trace.jsonl"
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(_jsonable_debug_value(record), ensure_ascii=False) + "\n")
 
 
 def rollout(
@@ -140,6 +213,25 @@ def rollout(
     # Reset the policy and environments.
     policy.reset()
     observation, info = env.reset(seed=seeds)
+    try:
+        rollout_policy_task_instructions = list(env.call("task_description"))
+    except Exception:
+        task_goal = info.get("task_goal") if isinstance(info, dict) else None
+        rollout_policy_task_instructions = (
+            list(task_goal) if task_goal is not None else [None] * env.num_envs
+        )
+    try:
+        rollout_task_instructions = list(env.call("episode_task_instruction"))
+    except Exception:
+        rollout_task_instructions = rollout_policy_task_instructions
+    try:
+        rollout_episode_indices = list(env.call("_current_episode_index"))
+    except Exception:
+        rollout_episode_indices = [None] * env.num_envs
+    try:
+        rollout_episode_seeds = list(env.call("_current_episode_seed"))
+    except Exception:
+        rollout_episode_seeds = [None] * env.num_envs
     if render_callback is not None:
         render_callback(env)
 
@@ -173,14 +265,25 @@ def rollout(
         # Apply environment-specific preprocessing (e.g., LiberoProcessorStep for LIBERO)
         observation = env_preprocessor(observation)
 
+        debug_observation = observation
         observation = preprocessor(observation)
         with torch.inference_mode():
             action = policy.select_action(observation)
+        raw_action = action
         action = postprocessor(action)
 
         action_transition = {ACTION: action}
         action_transition = env_postprocessor(action_transition)
         action = action_transition[ACTION]
+
+        _append_robomme_policy_debug(
+            env,
+            policy,
+            step=step,
+            observation=debug_observation,
+            raw_action=raw_action,
+            action=action,
+        )
 
         # Convert to CPU / numpy.
         action_numpy: np.ndarray = action.to("cpu").numpy()
@@ -235,6 +338,10 @@ def rollout(
         "reward": torch.stack(all_rewards, dim=1),
         "success": torch.stack(all_successes, dim=1),
         "done": torch.stack(all_dones, dim=1),
+        "task_instruction": rollout_task_instructions,
+        "policy_task_instruction": rollout_policy_task_instructions,
+        "env_episode_index": rollout_episode_indices,
+        "env_episode_seed": rollout_episode_seeds,
     }
     if return_observations:
         stacked_observations = {}
@@ -302,6 +409,10 @@ def eval_policy(
     max_rewards = []
     all_successes = []
     all_seeds = []
+    all_task_instructions = []
+    all_policy_task_instructions = []
+    all_env_episode_indices = []
+    all_env_episode_seeds = []
     threads = []  # for video saving threads
     n_episodes_rendered = 0  # for saving the correct number of videos
 
@@ -368,7 +479,13 @@ def eval_policy(
         if seeds:
             all_seeds.extend(seeds)
         else:
-            all_seeds.append(None)
+            all_seeds.extend([None] * env.num_envs)
+        all_task_instructions.extend(rollout_data.get("task_instruction", [None] * env.num_envs))
+        all_policy_task_instructions.extend(
+            rollout_data.get("policy_task_instruction", [None] * env.num_envs)
+        )
+        all_env_episode_indices.extend(rollout_data.get("env_episode_index", [None] * env.num_envs))
+        all_env_episode_seeds.extend(rollout_data.get("env_episode_seed", [None] * env.num_envs))
 
         # FIXME: episode_data is either None or it doesn't exist
         if return_episode_data:
@@ -429,13 +546,30 @@ def eval_policy(
                 "max_reward": max_reward,
                 "success": success,
                 "seed": seed,
+                "env_episode_index": env_episode_index,
+                "env_episode_seed": env_episode_seed,
+                "task_instruction": task_instruction,
+                "policy_task_instruction": policy_task_instruction,
             }
-            for i, (sum_reward, max_reward, success, seed) in enumerate(
+            for i, (
+                sum_reward,
+                max_reward,
+                success,
+                seed,
+                env_episode_index,
+                env_episode_seed,
+                task_instruction,
+                policy_task_instruction,
+            ) in enumerate(
                 zip(
                     sum_rewards[:n_episodes],
                     max_rewards[:n_episodes],
                     all_successes[:n_episodes],
                     all_seeds[:n_episodes],
+                    all_env_episode_indices[:n_episodes],
+                    all_env_episode_seeds[:n_episodes],
+                    all_task_instructions[:n_episodes],
+                    all_policy_task_instructions[:n_episodes],
                     strict=True,
                 )
             )
@@ -586,6 +720,10 @@ class TaskMetrics(TypedDict):
     max_rewards: list[float]
     successes: list[bool]
     video_paths: list[str]
+    task_instructions: list[str | None]
+    policy_task_instructions: list[str | None]
+    env_episode_indices: list[int | None]
+    env_episode_seeds: list[int | None]
 
 
 ACC_KEYS = ("sum_rewards", "max_rewards", "successes", "video_paths")
@@ -629,6 +767,10 @@ def eval_one(
         max_rewards=[ep["max_reward"] for ep in per_episode],
         successes=[ep["success"] for ep in per_episode],
         video_paths=task_result.get("video_paths", []),
+        task_instructions=[ep.get("task_instruction") for ep in per_episode],
+        policy_task_instructions=[ep.get("policy_task_instruction") for ep in per_episode],
+        env_episode_indices=[ep.get("env_episode_index") for ep in per_episode],
+        env_episode_seeds=[ep.get("env_episode_seed") for ep in per_episode],
     )
 
 

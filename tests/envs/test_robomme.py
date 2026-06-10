@@ -16,9 +16,11 @@
 
 import numpy as np
 
+from lerobot.envs import robomme_raw
 from lerobot.envs.configs import RobommeEnv
 from lerobot.envs.factory import make_env, make_env_config
 from lerobot.envs.robomme import RobommeEpisodeEnv
+from robomme.robomme_env.utils.subgoal_evaluate_func import correct_timestep
 
 
 def _make_rgb(fill_value: int, height: int = 4, width: int = 6) -> np.ndarray:
@@ -161,3 +163,215 @@ def test_make_env_builds_robomme_vector_env(monkeypatch):
     assert obs["agent_pos"].shape == (2, 8)
     assert len(info["episode_index"]) == 2
     vec_env.close()
+
+
+def test_robomme_raw_absolute_ee_pose_maps_to_normalized_delta_command(monkeypatch):
+    monkeypatch.setattr(
+        robomme_raw,
+        "_eef_state",
+        lambda raw_env: np.array([0.0, 0.0, 0.2, np.pi, 0.0, 0.0], dtype=np.float32),
+    )
+    target = np.array([0.05, -0.2, 0.25, np.pi + 0.05, -0.2, 0.0, -1.0], dtype=np.float32)
+
+    command = robomme_raw._to_delta(target, raw_env=object())
+
+    # Position commands are normalized by Panda's +/-0.1 m controller bound.
+    np.testing.assert_allclose(command[:3], np.array([0.5, -1.0, 0.5], dtype=np.float32))
+    # Rotation commands are normalized by the +/-0.1 rad bound and negated to
+    # compensate for ManiSkill's rot_lower=-0.1 scaling convention.
+    np.testing.assert_allclose(
+        command[3:6], np.array([-0.24253564, 0.97014254, -0.0], dtype=np.float32), atol=1e-6
+    )
+    assert command[-1] == -1.0
+    assert np.linalg.norm(command[3:6]) <= 1.0 + 1e-6
+
+
+class _FakeRawUnwrapped:
+    def __init__(self):
+        self.failureflag = object()
+        self.successflag = object()
+        self.current_task_failure = object()
+        self.swing_over_limit = object()
+        self.episode_success = object()
+
+
+class _FakeRawEnv:
+    def __init__(self):
+        self.unwrapped = _FakeRawUnwrapped()
+
+
+def test_robomme_raw_clears_sticky_episode_flags_when_reusing_env():
+    raw = _FakeRawEnv()
+
+    robomme_raw._clear_robomme_episode_flags(raw)
+
+    for name in (
+        "failureflag",
+        "successflag",
+        "current_task_failure",
+        "swing_over_limit",
+        "episode_success",
+    ):
+        assert not hasattr(raw.unwrapped, name)
+
+
+class _FakeRawBuilder:
+    def __init__(self, env_id: str, dataset: str, action_space: str, render_mode: str):
+        self.env_id = env_id
+        self.dataset = dataset
+        self.action_space = action_space
+        self.render_mode = render_mode
+
+    def get_episode_num(self) -> int:
+        return 2
+
+    def resolve_episode(self, episode_idx: int):
+        return episode_idx + 100, None
+
+
+class _FakeResetRawEnv:
+    def __init__(self, env_id: int):
+        self.env_id = env_id
+        self.closed = False
+        self.reset_calls = []
+        self.unwrapped = type("FakeUnwrapped", (), {})()
+
+    def reset(self, seed=None, options=None):
+        self.reset_calls.append((seed, dict(options or {})))
+        return {"env_id": self.env_id, "reset_count": len(self.reset_calls)}, {}
+
+    def close(self):
+        self.closed = True
+
+
+def test_robomme_raw_reset_force_reconfigures_without_recreating_env(monkeypatch):
+    created_envs = []
+
+    def fake_make(*args, **kwargs):
+        raw = _FakeResetRawEnv(len(created_envs))
+        created_envs.append(raw)
+        return raw
+
+    monkeypatch.setattr(robomme_raw, "_ensure_robomme_env_registered", lambda: None)
+    monkeypatch.setattr(robomme_raw.gym, "make", fake_make)
+    monkeypatch.setattr(
+        robomme_raw, "_convert_obs", lambda raw_obs, raw_env: {"env_id": raw_env.env_id}
+    )
+
+    env = robomme_raw.RobommeRawEpisodeEnv(
+        task_name="SwingXtimes",
+        split="test",
+        episode_indices=[0, 1],
+        builder_cls=_FakeRawBuilder,
+    )
+
+    obs0, info0 = env.reset()
+    obs1, info1 = env.reset()
+
+    assert len(created_envs) == 1
+    assert obs0 == {"env_id": 0}
+    assert obs1 == {"env_id": 0}
+    assert info0["episode_index"] == 0
+    assert info1["episode_index"] == 1
+    assert created_envs[0].closed is False
+    assert created_envs[0].reset_calls == [
+        (100, {"reconfigure": True}),
+        (101, {"reconfigure": True}),
+    ]
+
+    env.close()
+    assert created_envs[0].closed is True
+
+
+def test_robomme_raw_reset_retries_scene_generation_failures(monkeypatch):
+    class FlakyResetRawEnv(_FakeResetRawEnv):
+        def reset(self, seed=None, options=None):
+            self.reset_calls.append((seed, dict(options or {})))
+            if len(self.reset_calls) == 1:
+                raise RuntimeError("spawn_random_cube: Region crowded or constraints too tight")
+            return {"env_id": self.env_id}, {}
+
+    created_envs = []
+
+    def fake_make(*args, **kwargs):
+        raw = FlakyResetRawEnv(len(created_envs))
+        created_envs.append(raw)
+        return raw
+
+    monkeypatch.setattr(robomme_raw, "_ensure_robomme_env_registered", lambda: None)
+    monkeypatch.setattr(robomme_raw.gym, "make", fake_make)
+    monkeypatch.setattr(
+        robomme_raw, "_convert_obs", lambda raw_obs, raw_env: {"env_id": raw_env.env_id}
+    )
+
+    env = robomme_raw.RobommeRawEpisodeEnv(
+        task_name="VideoRepick",
+        split="test",
+        episode_indices=[0],
+        builder_cls=_FakeRawBuilder,
+    )
+
+    _, info = env.reset()
+
+    assert info["episode_index"] == 0
+    assert info["episode_seed"] == 101
+    assert info["reset_attempts"] == 2
+    assert created_envs[0].reset_calls == [
+        (100, {"reconfigure": True}),
+        (101, {"reconfigure": True}),
+    ]
+
+    env.close()
+
+
+def test_robomme_raw_reset_skips_episode_after_exhausted_scene_generation(monkeypatch):
+    class EpisodeSkippingRawEnv(_FakeResetRawEnv):
+        def reset(self, seed=None, options=None):
+            self.reset_calls.append((seed, dict(options or {})))
+            if seed == 100:
+                raise RuntimeError("spawn_random_cube: Region crowded or constraints too tight")
+            return {"env_id": self.env_id}, {}
+
+    created_envs = []
+
+    def fake_make(*args, **kwargs):
+        raw = EpisodeSkippingRawEnv(len(created_envs))
+        created_envs.append(raw)
+        return raw
+
+    monkeypatch.setattr(robomme_raw, "_MAX_SCENE_RESET_ATTEMPTS", 1)
+    monkeypatch.setattr(robomme_raw, "_ensure_robomme_env_registered", lambda: None)
+    monkeypatch.setattr(robomme_raw.gym, "make", fake_make)
+    monkeypatch.setattr(
+        robomme_raw, "_convert_obs", lambda raw_obs, raw_env: {"env_id": raw_env.env_id}
+    )
+
+    env = robomme_raw.RobommeRawEpisodeEnv(
+        task_name="VideoRepick",
+        split="test",
+        episode_indices=[0, 1],
+        builder_cls=_FakeRawBuilder,
+    )
+
+    _, info = env.reset()
+
+    assert info["episode_index"] == 1
+    assert info["episode_seed"] == 101
+    assert info["reset_attempts"] == 1
+    assert info["skipped_episode_indices"] == [0]
+    assert created_envs[0].reset_calls == [
+        (100, {"reconfigure": True}),
+        (101, {"reconfigure": True}),
+    ]
+
+    env.close()
+
+
+def test_robomme_correct_timestep_handles_missing_stop_timestep():
+    class DummyEnv:
+        elapsed_steps = 0
+
+    assert correct_timestep(DummyEnv(), time_range=(10, 20), stop_timestep=None) is False
+    assert correct_timestep(DummyEnv(), time_range=None, stop_timestep=12) is False
+    assert correct_timestep(DummyEnv(), time_range=(10, 20), stop_timestep=12) is True
+    assert correct_timestep(DummyEnv(), time_range=(10, 20), stop_timestep=25) is False

@@ -47,12 +47,16 @@ Usage with lerobot-eval:
 from __future__ import annotations
 
 import importlib
+import json
+import os
 from collections.abc import Callable, Sequence
 from functools import partial
+from pathlib import Path
 from typing import Any
 
 import gymnasium as gym
 import numpy as np
+import torch
 from gymnasium import spaces
 from scipy.spatial.transform import Rotation
 
@@ -66,11 +70,76 @@ from lerobot.envs.robomme import (
 _CONTROL_MODE = "pd_ee_delta_pose"
 _FRONT_CAM = "base_camera"
 _WRIST_CAM = "hand_camera"
+# Panda pd_ee_delta_pose exposes a normalized [-1, 1] action space that maps
+# to physical deltas of +/-0.1 m and +/-0.1 rad inside ManiSkill.
+_PD_EE_DELTA_POS_LIMIT = 0.1
+_PD_EE_DELTA_ROT_LIMIT = 0.1
+_MAX_SCENE_RESET_ATTEMPTS = 10
 
 
 # ---------------------------------------------------------------------------
 # Module-level helpers
 # ---------------------------------------------------------------------------
+
+
+
+def _refresh_robomme_random_state(raw_env, seed: int | None, difficulty_hint: str | None) -> None:
+    """Refresh RoboMME task RNG fields before a force-reconfigure reset.
+
+    Several RoboMME tasks derive scene-generation state in ``__init__`` rather
+    than in ``reset``. Since RobommeRawEpisodeEnv reuses the raw env to avoid
+    leaking SAPIEN render devices, refresh those fields explicitly so each
+    benchmark episode gets its own seed/difficulty semantics.
+    """
+    if seed is None:
+        return
+
+    unwrapped = raw_env.unwrapped
+    seed = int(seed)
+    if hasattr(unwrapped, "seed"):
+        unwrapped.seed = seed
+    np.random.seed(seed)
+
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    if hasattr(unwrapped, "generator"):
+        unwrapped.generator = generator
+
+    difficulty = difficulty_hint
+    if difficulty is not None:
+        try:
+            from robomme.robomme_env.utils.difficulty import normalize_robomme_difficulty
+
+            difficulty = normalize_robomme_difficulty(difficulty)
+        except Exception:
+            difficulty = str(difficulty).lower()
+    elif hasattr(unwrapped, "difficulty"):
+        seed_mod = seed % 3
+        difficulty = "easy" if seed_mod == 0 else ("medium" if seed_mod == 1 else "hard")
+
+    if difficulty is not None and hasattr(unwrapped, "difficulty"):
+        unwrapped.difficulty = difficulty
+
+    if hasattr(unwrapped, "num_repeats"):
+        unwrapped.num_repeats = torch.randint(1, 4, (1,), generator=generator).item()
+
+    configs = getattr(unwrapped, "configs", None)
+    difficulty_key = getattr(unwrapped, "difficulty", None)
+    if hasattr(unwrapped, "swap_times") and configs and difficulty_key in configs:
+        cfg = configs[difficulty_key]
+        if "swap_min" in cfg and "swap_max" in cfg:
+            unwrapped.swap_times = torch.randint(
+                cfg["swap_min"], cfg["swap_max"] + 1, (1,), generator=generator
+            ).item()
+
+
+def _is_scene_generation_error(exc: BaseException) -> bool:
+    """Return True for RoboMME stochastic scene-generation failures."""
+    if exc.__class__.__name__ == "SceneGenerationError":
+        return True
+    message = str(exc)
+    return "spawn_random_cube" in message or "Failed to generate" in message
+
 
 def _ensure_robomme_env_registered() -> None:
     """Import robomme.robomme_env so all task gym IDs are registered."""
@@ -152,22 +221,84 @@ def _convert_obs(raw_obs: dict, raw_env) -> dict:
     }
 
 
-def _to_delta(target_ee: np.ndarray, raw_env) -> np.ndarray:
-    """Convert absolute target ee_pose to pd_ee_delta_pose delta.
 
-    Args:
-        target_ee: (7,) float32 – [x, y, z, roll, pitch, yaw, gripper]
-        raw_env: live ManiSkill3 env (for reading current TCP state)
+def _robomme_episode_task_instruction(raw_env, task_name: str) -> str:
+    """Return the full episode-level RoboMME language goal when available."""
+    try:
+        from robomme.robomme_env.utils import task_goal
 
-    Returns:
-        (7,) float32 – [delta_x, delta_y, delta_z, delta_roll, delta_pitch, delta_yaw, gripper]
-    """
-    current = _eef_state(raw_env)  # (6,)
-    delta_xyz = target_ee[:3] - current[:3]
-    delta_rpy = target_ee[3:6] - current[3:6]
-    # Wrap angle deltas to [-π, π] to avoid large jumps
+        goals = task_goal.get_language_goal(raw_env, task_name)
+    except Exception:
+        return task_name
+    if isinstance(goals, (list, tuple)) and goals:
+        first = goals[0]
+        if isinstance(first, str) and first.strip():
+            return first
+    return task_name
+
+
+def _desired_ee_delta(target_ee: np.ndarray, current_ee: np.ndarray) -> np.ndarray:
+    """Return desired physical TCP delta [dx, dy, dz, droll, dpitch, dyaw]."""
+    delta_xyz = target_ee[:3] - current_ee[:3]
+    delta_rpy = target_ee[3:6] - current_ee[3:6]
     delta_rpy = (delta_rpy + np.pi) % (2.0 * np.pi) - np.pi
-    return np.concatenate([delta_xyz, delta_rpy, [target_ee[6]]]).astype(np.float32)
+    return np.concatenate([delta_xyz, delta_rpy]).astype(np.float32)
+
+
+def _to_delta(target_ee: np.ndarray, raw_env) -> np.ndarray:
+    """Convert absolute target ee_pose to ManiSkill normalized pd_ee_delta_pose action.
+
+    RoboMME/OpenPI actions are absolute ee targets. ManiSkill's Panda
+    ``pd_ee_delta_pose`` controller, however, exposes a normalized action space:
+    xyz inputs in [-1, 1] are scaled to +/-0.1 m and rotation inputs are scaled
+    to +/-0.1 rad. Convert physical deltas into that normalized controller
+    command before calling ``raw_env.step``.
+    """
+    current = _eef_state(raw_env)
+    desired_delta = _desired_ee_delta(target_ee, current)
+    delta_xyz_cmd = np.clip(desired_delta[:3] / _PD_EE_DELTA_POS_LIMIT, -1.0, 1.0)
+    # ManiSkill's PDEEPoseController multiplies normalized rotation by rot_lower
+    # (-0.1 for Panda), so negate here to request the intended physical sign.
+    delta_rpy_cmd = -desired_delta[3:6] / _PD_EE_DELTA_ROT_LIMIT
+    rot_norm = np.linalg.norm(delta_rpy_cmd)
+    if rot_norm > 1.0:
+        delta_rpy_cmd = delta_rpy_cmd / rot_norm
+    return np.concatenate([delta_xyz_cmd, delta_rpy_cmd, [target_ee[6]]]).astype(np.float32)
+
+
+def _clear_robomme_episode_flags(raw_env) -> None:
+    """Clear RoboMME task-level sticky flags when reusing a raw env instance.
+
+    The official BenchmarkEnvBuilder creates a fresh wrapped env per benchmark
+    episode. RobommeRawEpisodeEnv intentionally reuses the raw ManiSkill env to
+    avoid mplib, so clear failure/success state that some RoboMME tasks keep as
+    Python attributes across steps.
+    """
+    unwrapped = raw_env.unwrapped
+    for name in (
+        "failureflag",
+        "successflag",
+        "current_task_failure",
+        "swing_over_limit",
+        "episode_success",
+    ):
+        if hasattr(unwrapped, name):
+            try:
+                delattr(unwrapped, name)
+            except AttributeError:
+                pass
+
+
+def _debug_jsonable(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, (list, tuple)):
+        return [_debug_jsonable(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _debug_jsonable(item) for key, item in value.items()}
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -215,7 +346,8 @@ class RobommeRawEpisodeEnv(gym.Env):
             raise ValueError(f"Unsupported split: {split!r}. Expected one of {ROBOMME_SPLITS}.")
 
         self.task = task_name
-        self.task_description: str = task_name  # updated after reset() / step()
+        self.task_description: str = task_name  # online subtask, updated after reset() / step()
+        self.episode_task_instruction: str = task_name  # full episode-level language goal
         self.split = split
         self.episode_length = episode_length
         self.observation_height = observation_height
@@ -234,10 +366,15 @@ class RobommeRawEpisodeEnv(gym.Env):
         self._episode_indices = self._resolve_episode_indices(episode_indices)
         self._episode_cursor = int(start_offset) % len(self._episode_indices)
         self._current_episode_index: int | None = None
+        self._current_episode_seed: int | None = None
+        self._current_reset_attempts = 0
+        self._skipped_episode_indices: list[int] = []
 
-        # Raw ManiSkill3 env – created lazily in first reset(), reused across episodes
+        # Raw ManiSkill3 env - created once, then force-reconfigured on reset.
+        # This gives each episode a fresh scene without leaking render devices.
         self._raw_env: gym.Env | None = None
         self._last_obs: dict | None = None
+        self._step_index = 0
 
         action_dim = ROBOMME_ACTION_SPACE_SHAPES["ee_pose"]  # 7
         self.observation_space = spaces.Dict(
@@ -279,7 +416,7 @@ class RobommeRawEpisodeEnv(gym.Env):
         return resolved
 
     def _get_raw_env(self) -> gym.Env:
-        """Lazily create the raw ManiSkill3 gym env (once per wrapper instance)."""
+        """Create the raw ManiSkill3 gym env once per vector-env slot."""
         if self._raw_env is None:
             _ensure_robomme_env_registered()
             self._raw_env = gym.make(
@@ -306,22 +443,61 @@ class RobommeRawEpisodeEnv(gym.Env):
         super().reset(seed=seed)
         raw = self._get_raw_env()
 
-        episode_idx = self._episode_indices[self._episode_cursor]
-        self._episode_cursor = (self._episode_cursor + self._episode_stride) % len(
-            self._episode_indices
-        )
-        self._current_episode_index = episode_idx
+        raw_options = dict(options or {})
+        raw_options["reconfigure"] = True
+        last_exc: BaseException | None = None
+        raw_obs = None
+        episode_idx = None
+        self._skipped_episode_indices = []
 
-        meta_seed, _ = self._builder.resolve_episode(episode_idx)
-        reset_seed = int(meta_seed) if meta_seed is not None else seed
+        for candidate_ix in range(len(self._episode_indices)):
+            episode_idx = self._episode_indices[self._episode_cursor]
+            self._episode_cursor = (self._episode_cursor + self._episode_stride) % len(
+                self._episode_indices
+            )
 
-        raw_obs, _ = raw.reset(seed=reset_seed)
+            meta_seed, difficulty_hint = self._builder.resolve_episode(episode_idx)
+            reset_seed = int(meta_seed) if meta_seed is not None else seed
+
+            for attempt in range(_MAX_SCENE_RESET_ATTEMPTS):
+                attempt_seed = None if reset_seed is None else int(reset_seed) + attempt
+                _refresh_robomme_random_state(raw, attempt_seed, difficulty_hint)
+                try:
+                    raw_obs, _ = raw.reset(seed=attempt_seed, options=raw_options)
+                    self._current_episode_index = episode_idx
+                    self._current_episode_seed = attempt_seed
+                    self._current_reset_attempts = attempt + 1
+                    break
+                except Exception as exc:
+                    if not _is_scene_generation_error(exc):
+                        raise
+                    last_exc = exc
+            if raw_obs is not None:
+                break
+            self._skipped_episode_indices.append(int(episode_idx))
+        else:
+            raise RuntimeError(
+                f"Failed to generate a valid RoboMME scene for {self.task} after "
+                f"trying {len(self._episode_indices)} episode indices with "
+                f"{_MAX_SCENE_RESET_ATTEMPTS} seeds each."
+            ) from last_exc
+
+        _clear_robomme_episode_flags(raw)
+        self._step_index = 0
+        if raw_obs is None or episode_idx is None:
+            raise RuntimeError("RoboMME reset did not return an observation.")
         self._last_obs = _convert_obs(raw_obs, raw)
+        self.episode_task_instruction = _robomme_episode_task_instruction(raw, self.task)
         self._update_task_description()
 
         info = {
             "task_goal": [self.task_description],
+            "task_instruction": self.task_description,
+            "episode_task_instruction": self.episode_task_instruction,
             "episode_index": episode_idx,
+            "episode_seed": self._current_episode_seed,
+            "reset_attempts": self._current_reset_attempts,
+            "skipped_episode_indices": list(self._skipped_episode_indices),
             "task": self.task,
         }
         return self._last_obs, info
@@ -330,7 +506,10 @@ class RobommeRawEpisodeEnv(gym.Env):
         if self._raw_env is None:
             raise RuntimeError("reset() must be called before step().")
 
-        delta = _to_delta(np.asarray(action, dtype=np.float32), self._raw_env)
+        target = np.asarray(action, dtype=np.float32).reshape(-1)
+        current_before = _eef_state(self._raw_env)
+        desired_delta = _desired_ee_delta(target, current_before)
+        delta = _to_delta(target, self._raw_env)
         raw_obs, reward, terminated, truncated, info = self._raw_env.step(delta)
 
         terminated = bool(terminated)
@@ -351,9 +530,25 @@ class RobommeRawEpisodeEnv(gym.Env):
         self._update_task_description()
 
         reward_val = float(np.asarray(reward).ravel()[0])
+        self._append_debug_trace(
+            target=target,
+            current_before=current_before,
+            desired_delta=desired_delta,
+            delta=delta,
+            reward=reward_val,
+            terminated=terminated,
+            truncated=truncated,
+            is_success=is_success,
+            raw_info=info,
+        )
+        self._step_index += 1
         info_out: dict[str, Any] = {
             "task": self.task,
             "episode_index": self._current_episode_index,
+            "episode_seed": self._current_episode_seed,
+            "task_instruction": self.task_description,
+            "episode_task_instruction": self.episode_task_instruction,
+            "skipped_episode_indices": list(self._skipped_episode_indices),
             "is_success": is_success,
         }
 
@@ -363,11 +558,80 @@ class RobommeRawEpisodeEnv(gym.Env):
             info_out["final_info"] = {
                 "task": self.task,
                 "episode_index": self._current_episode_index,
+                "episode_seed": self._current_episode_seed,
+                "task_instruction": self.task_description,
+                "episode_task_instruction": self.episode_task_instruction,
+                "skipped_episode_indices": list(self._skipped_episode_indices),
                 "is_success": is_success,
                 "status": status,
             }
 
         return self._last_obs, reward_val, terminated, truncated, info_out
+
+    def _append_debug_trace(
+        self,
+        *,
+        target: np.ndarray,
+        current_before: np.ndarray,
+        desired_delta: np.ndarray,
+        delta: np.ndarray,
+        reward: float,
+        terminated: bool,
+        truncated: bool,
+        is_success: bool,
+        raw_info: dict[str, Any],
+    ) -> None:
+        debug_dir = os.environ.get("LEROBOT_ROBOMME_DEBUG_DIR")
+        if not debug_dir:
+            return
+
+        max_steps = int(os.environ.get("LEROBOT_ROBOMME_DEBUG_MAX_STEPS", "0") or 0)
+        if max_steps > 0 and self._step_index >= max_steps:
+            return
+
+        selected_episode = os.environ.get("LEROBOT_ROBOMME_DEBUG_EPISODE")
+        if (
+            selected_episode not in (None, "")
+            and str(self._current_episode_index) != selected_episode
+        ):
+            return
+
+        out_dir = Path(debug_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        raw_success = raw_info.get("success")
+        raw_fail = raw_info.get("fail")
+        record = {
+            "source": "robomme_raw.step",
+            "step": self._step_index,
+            "episode_index": self._current_episode_index,
+            "time_sec_at_30fps": self._step_index / 30.0,
+            "task": self.task,
+            "task_description": self.task_description,
+            "target_absolute_ee_pose": target,
+            "current_ee_pose_before_step": current_before,
+            "desired_physical_delta_ee_pose": desired_delta,
+            "normalized_action_sent_to_pd_ee_delta_pose": delta,
+            "desired_delta_translation_l2": float(np.linalg.norm(desired_delta[:3])),
+            "desired_delta_rotation_l2": float(np.linalg.norm(desired_delta[3:6])),
+            "normalized_command_translation_l2": float(np.linalg.norm(delta[:3])),
+            "normalized_command_rotation_l2": float(np.linalg.norm(delta[3:6])),
+            "target_translation_l2": float(np.linalg.norm(target[:3])),
+            "target_rotation_l2": float(np.linalg.norm(target[3:6])),
+            "reward": reward,
+            "terminated": terminated,
+            "truncated": truncated,
+            "is_success": is_success,
+            "raw_success": (
+                bool(raw_success.any().cpu().numpy()) if raw_success is not None else None
+            ),
+            "raw_fail": bool(raw_fail.any().cpu().numpy()) if raw_fail is not None else None,
+            "observation_state_after_step": (
+                self._last_obs.get("agent_pos") if self._last_obs else None
+            ),
+        }
+        path = out_dir / f"eval_episode_{self._current_episode_index}_step_trace.jsonl"
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(_debug_jsonable(record), ensure_ascii=False) + "\n")
 
     def render(self):
         if self._last_obs is None:
@@ -378,6 +642,9 @@ class RobommeRawEpisodeEnv(gym.Env):
         return np.concatenate([p["image"], p["image2"]], axis=1)
 
     def close(self):
+        self._close_raw_env()
+
+    def _close_raw_env(self) -> None:
         if self._raw_env is not None:
             try:
                 self._raw_env.close()
