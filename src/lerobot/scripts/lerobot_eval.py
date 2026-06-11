@@ -639,41 +639,40 @@ def _compile_episode_data(
 
 @parser.wrap()
 def eval_main(cfg: EvalPipelineConfig):
-    logging.info(pformat(asdict(cfg)))
+    logging.info(pformat(asdict(cfg))) #格式化打印cfg（本次评估的参数）
 
     # Check device is available
     device = get_safe_torch_device(cfg.policy.device, log=True)
 
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
-    set_seed(cfg.seed)
+    set_seed(cfg.seed) #固定的随机种子
 
     logging.info(colored("Output dir:", "yellow", attrs=["bold"]) + f" {cfg.output_dir}")
 
     logging.info("Making environment.")
     envs = make_env(
         cfg.env,
-        n_envs=cfg.eval.batch_size,
-        use_async_envs=cfg.eval.use_async_envs,
+        n_envs=cfg.eval.batch_size, #并行数量
+        use_async_envs=cfg.eval.use_async_envs, #是否异步
         trust_remote_code=cfg.trust_remote_code,
     )
 
     logging.info("Making policy.")
-
     policy = make_policy(
         cfg=cfg.policy,
         env_cfg=cfg.env,
         rename_map=cfg.rename_map,
     )
 
-    policy.eval()
+    policy.eval() #把模型切到推理模式，关闭 dropout、BN 的训练行为等。
 
     # The inference device is automatically set to match the detected hardware, overriding any previous device settings from training to ensure compatibility.
     preprocessor_overrides = {
         "device_processor": {"device": str(policy.config.device)},
         "rename_observations_processor": {"rename_map": cfg.rename_map},
     }
-
+    #构建预处理器和后处理器
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=cfg.policy,
         pretrained_path=cfg.policy.pretrained_path,
@@ -681,8 +680,10 @@ def eval_main(cfg: EvalPipelineConfig):
     )
 
     # Create environment-specific preprocessor and postprocessor (e.g., for LIBERO environments)
+    #针对特定环境构建专用的处理器
     env_preprocessor, env_postprocessor = make_env_pre_post_processors(env_cfg=cfg.env, policy_cfg=cfg.policy)
 
+    #核心评估函数
     with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
         info = eval_policy_all(
             envs=envs,
@@ -692,7 +693,7 @@ def eval_main(cfg: EvalPipelineConfig):
             preprocessor=preprocessor,
             postprocessor=postprocessor,
             n_episodes=cfg.eval.n_episodes,
-            max_episodes_rendered=10,
+            max_episodes_rendered=10, #生成最多10个视频
             videos_dir=Path(cfg.output_dir) / "videos",
             start_seed=cfg.seed,
             max_parallel_tasks=cfg.env.max_parallel_tasks,

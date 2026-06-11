@@ -209,18 +209,18 @@ def make_env(
             gym_kwargs=cfg.gym_kwargs,
             env_cls=env_cls,
         )
-    elif "robomme" in cfg.type:
-        from lerobot.envs.robomme import create_robomme_envs
+    # elif "robomme" in cfg.type: #这个robomme应该是被创建错的
+    #     from lerobot.envs.robomme import create_robomme_envs
 
-        if cfg.task is None:
-            raise ValueError("RobommeEnv requires a task to be specified")
+    #     if cfg.task is None:
+    #         raise ValueError("RobommeEnv requires a task to be specified")
 
-        return create_robomme_envs(
-            task=cfg.task,
-            n_envs=n_envs,
-            gym_kwargs=cfg.gym_kwargs,
-            env_cls=env_cls,
-        )
+    #     return create_robomme_envs(
+    #         task=cfg.task,
+    #         n_envs=n_envs,
+    #         gym_kwargs=cfg.gym_kwargs,
+    #         env_cls=env_cls,
+    #     )
 
     if cfg.gym_id not in gym_registry:
         print(f"gym id '{cfg.gym_id}' not found, attempting to import '{cfg.package_name}'...")

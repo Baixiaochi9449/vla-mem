@@ -39,29 +39,39 @@ class PI05V2DeepseekPytorch(PI05Pytorch):
         self.prefix_width = paligemma_config.width
         self.expert_width = action_expert_config.width
 
-        self.memory_encoder = Pi05V2DeepseekMemoryEncoder(
-            config=config,
-            vision_dim=self.prefix_width,
-            expert_dim=self.expert_width,
-        )
+        self.memory_encoder = None
+        self.dynamic_lora_hypernet = None
+        self._dynamic_lora_wrappers: dict[str, DynamicLoRALinear] = {}
+        if config.memory_enabled:
+            self.memory_encoder = Pi05V2DeepseekMemoryEncoder(
+                config=config,
+                vision_dim=self.prefix_width,
+                expert_dim=self.expert_width,
+            )
 
-        target_specs = self._install_dynamic_lora_wrappers(config)
-        self.dynamic_lora_hypernet = DynamicLoRABasisHyperNet(
-            latent_dim=self.expert_width,
-            hidden_dim=config.lora_hidden_dim,
-            rank=config.lora_rank,
-            basis_count=config.lora_basis_count,
-            target_specs=target_specs,
-            scale_init=config.lora_scale_init,
-        )
+            target_specs = self._install_dynamic_lora_wrappers(config)
+            self.dynamic_lora_hypernet = DynamicLoRABasisHyperNet(
+                latent_dim=self.expert_width,
+                hidden_dim=config.lora_hidden_dim,
+                rank=config.lora_rank,
+                basis_count=config.lora_basis_count,
+                target_specs=target_specs,
+                scale_init=config.lora_scale_init,
+            )
 
     def _install_dynamic_lora_wrappers(self, config: PI05V2DeepseekConfig) -> list[DynamicLoRATargetSpec]:
         target_specs: list[DynamicLoRATargetSpec] = []
-        self._dynamic_lora_wrappers: dict[str, DynamicLoRALinear] = {}
+        layers = self.paligemma_with_expert.gemma_expert.model.layers
         for layer_idx in config.lora_target_layers:
-            layer = self.paligemma_with_expert.gemma_expert.model.layers[layer_idx].self_attn
+            if layer_idx >= len(layers):
+                raise ValueError(
+                    f"lora_target_layers contains {layer_idx}, but action expert has {len(layers)} layers"
+                )
+            layer = layers[layer_idx].self_attn
             for module_name in config.lora_target_modules:
                 source_linear = getattr(layer, module_name)
+                if not isinstance(source_linear, nn.Linear):
+                    raise TypeError(f"LoRA target {module_name!r} in layer {layer_idx} is not an nn.Linear")
                 target_key = f"expert.layers.{layer_idx}.{module_name}"
                 wrapper = DynamicLoRALinear(source_linear, target_key=target_key)
                 setattr(layer, module_name, wrapper)
@@ -88,6 +98,9 @@ class PI05V2DeepseekPytorch(PI05Pytorch):
         memory_delta_indices: Tensor | None,
     ) -> Tensor:
         self.clear_dynamic_lora()
+        if not self.config.memory_enabled or self.memory_encoder is None or self.dynamic_lora_hypernet is None:
+            batch_size = 1 if memory_state_window is None else memory_state_window.shape[0]
+            return self.action_in_proj.weight.new_zeros(batch_size, self.expert_width)
         if (
             memory_images_window is None
             or memory_image_mask is None
@@ -200,9 +213,8 @@ class PI05V2DeepseekPolicy(PI05Policy):
 
         The memory encoder and dynamic LoRA hypernet are new modules that do not exist in
         the pi05 checkpoint, so they will be listed as missing keys and stay randomly
-        initialized.  The DynamicLoRALinear wrappers copy their base weights from the
-        original linear layers during construction, so any pi05 expert-attention weights
-        that were loaded will be reflected there automatically.
+        initialized. DynamicLoRALinear wrappers keep the same q/v projection parameter
+        names as PI05, so compatible expert-attention weights load directly into them.
         """
         import logging
         from pathlib import Path
@@ -265,6 +277,11 @@ class PI05V2DeepseekPolicy(PI05Policy):
 
     def reset(self):
         self._action_queue = deque(maxlen=self.config.n_action_steps)
+        if not self.config.memory_enabled:
+            self._queues = {ACTION: deque(maxlen=self.config.n_action_steps)}
+            self.model.clear_dynamic_lora()
+            return
+
         history_size = max(abs(min(self.config.memory_history_deltas)), 1) + 1
         self._queues = {
             ACTION: deque(maxlen=self.config.n_action_steps),
@@ -335,16 +352,22 @@ class PI05V2DeepseekPolicy(PI05Policy):
         )
 
     def _build_online_memory_batch(self) -> tuple[Tensor | None, Tensor | None, Tensor | None, Tensor | None, Tensor | None]:
-        if OBS_STATE not in self._queues or len(self._queues[OBS_STATE]) == 0:
+        if not self.config.memory_enabled or OBS_STATE not in self._queues or len(self._queues[OBS_STATE]) == 0:
             return None, None, None, None, None
 
         state_history = torch.stack(list(self._queues[OBS_STATE]), dim=1)
         batch_size = state_history.shape[0]
         current_index = state_history.shape[1] - 1
-        selected_indices = [max(current_index + delta, 0) for delta in self.config.memory_history_deltas]
+        raw_indices = [current_index + delta for delta in self.config.memory_history_deltas]
+        valid_history = torch.tensor(
+            [idx >= 0 for idx in raw_indices],
+            dtype=torch.bool,
+            device=state_history.device,
+        )
+        selected_indices = [max(idx, 0) for idx in raw_indices]
 
         state_window = state_history[:, selected_indices]
-        state_pad = torch.zeros(batch_size, len(selected_indices), dtype=torch.bool, device=state_window.device)
+        state_pad = ~valid_history.unsqueeze(0).expand(batch_size, -1)
         delta_indices = torch.tensor(
             self.config.memory_history_deltas,
             dtype=torch.long,
@@ -358,9 +381,7 @@ class PI05V2DeepseekPolicy(PI05Policy):
                 continue
             image_history = torch.stack(list(self._queues[key]), dim=1)
             image_windows.append(image_history[:, selected_indices])
-            image_masks.append(
-                torch.ones(batch_size, len(selected_indices), dtype=torch.bool, device=image_history.device)
-            )
+            image_masks.append(valid_history.to(device=image_history.device).unsqueeze(0).expand(batch_size, -1))
 
         if len(image_windows) == 0:
             return None, None, state_window, state_pad, delta_indices
@@ -376,6 +397,8 @@ class PI05V2DeepseekPolicy(PI05Policy):
         return stacked_images, stacked_masks, state_window, state_pad, delta_indices
 
     def _update_online_memory_queues(self, batch: dict[str, Tensor]) -> None:
+        if not self.config.memory_enabled:
+            return
         queue_batch = {OBS_STATE: batch[OBS_STATE]}
         for key in self.config.image_features:
             if key in batch:

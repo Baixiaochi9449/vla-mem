@@ -403,20 +403,20 @@ def make_pre_post_processors(
             dataset_stats=kwargs.get("dataset_stats"),
         )
 
-    elif isinstance(policy_cfg, PI05Config):
-        from lerobot.policies.pi05.processor_pi05 import make_pi05_pre_post_processors
-
-        processors = make_pi05_pre_post_processors(
-            config=policy_cfg,
-            dataset_stats=kwargs.get("dataset_stats"),
-        )
-
     elif isinstance(policy_cfg, PI05V2DeepseekConfig):
         from lerobot.policies.pi05_v2_deepseek.processor_pi05_v2_deepseek import (
             make_pi05_v2_deepseek_pre_post_processors,
         )
 
         processors = make_pi05_v2_deepseek_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, PI05Config):
+        from lerobot.policies.pi05.processor_pi05 import make_pi05_pre_post_processors
+
+        processors = make_pi05_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )

@@ -46,8 +46,17 @@ class PI05V2DeepseekConfig(PI05Config):
     def __post_init__(self):
         super().__post_init__()
 
+        if not self.memory_enabled:
+            return
+
         if self.memory_max_cameras <= 0:
             raise ValueError("memory_max_cameras must be positive")
+        if self.memory_expert_dim <= 0:
+            raise ValueError("memory_expert_dim must be positive")
+        if self.memory_encoder_heads <= 0:
+            raise ValueError("memory_encoder_heads must be positive")
+        if self.memory_expert_dim % self.memory_encoder_heads != 0:
+            raise ValueError("memory_expert_dim must be divisible by memory_encoder_heads")
         if len(self.memory_history_deltas) == 0:
             raise ValueError("memory_history_deltas must not be empty")
         if any(delta >= 0 for delta in self.memory_history_deltas):
@@ -58,6 +67,8 @@ class PI05V2DeepseekConfig(PI05Config):
             raise ValueError("lora_basis_count must be positive")
         if len(self.lora_target_layers) == 0:
             raise ValueError("lora_target_layers must not be empty")
+        if any(layer_idx < 0 for layer_idx in self.lora_target_layers):
+            raise ValueError("lora_target_layers must be non-negative")
         if len(self.lora_target_modules) == 0:
             raise ValueError("lora_target_modules must not be empty")
 

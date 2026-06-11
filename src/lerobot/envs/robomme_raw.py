@@ -267,26 +267,19 @@ def _to_delta(target_ee: np.ndarray, raw_env) -> np.ndarray:
 
 
 def _clear_robomme_episode_flags(raw_env) -> None:
-    """Clear RoboMME task-level sticky flags when reusing a raw env instance.
+    """Reset RoboMME task-level sticky flags when reusing a raw env instance.
 
     The official BenchmarkEnvBuilder creates a fresh wrapped env per benchmark
-    episode. RobommeRawEpisodeEnv intentionally reuses the raw ManiSkill env to
-    avoid mplib, so clear failure/success state that some RoboMME tasks keep as
-    Python attributes across steps.
+    episode. RobommeRawEpisodeEnv reuses the raw ManiSkill env to avoid leaking
+    SAPIEN render devices, so reset sticky state explicitly.  Do not delete these
+    attributes: several RoboMME tasks access them directly during ``step()``.
     """
     unwrapped = raw_env.unwrapped
-    for name in (
-        "failureflag",
-        "successflag",
-        "current_task_failure",
-        "swing_over_limit",
-        "episode_success",
-    ):
-        if hasattr(unwrapped, name):
-            try:
-                delattr(unwrapped, name)
-            except AttributeError:
-                pass
+    unwrapped.failureflag = torch.tensor([False])
+    unwrapped.successflag = torch.tensor([False])
+    unwrapped.current_task_failure = False
+    unwrapped.swing_over_limit = False
+    unwrapped.episode_success = False
 
 
 def _debug_jsonable(value: Any) -> Any:

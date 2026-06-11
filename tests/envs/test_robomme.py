@@ -200,19 +200,16 @@ class _FakeRawEnv:
         self.unwrapped = _FakeRawUnwrapped()
 
 
-def test_robomme_raw_clears_sticky_episode_flags_when_reusing_env():
+def test_robomme_raw_resets_sticky_episode_flags_when_reusing_env():
     raw = _FakeRawEnv()
 
     robomme_raw._clear_robomme_episode_flags(raw)
 
-    for name in (
-        "failureflag",
-        "successflag",
-        "current_task_failure",
-        "swing_over_limit",
-        "episode_success",
-    ):
-        assert not hasattr(raw.unwrapped, name)
+    assert raw.unwrapped.failureflag.item() is False
+    assert raw.unwrapped.successflag.item() is False
+    assert raw.unwrapped.current_task_failure is False
+    assert raw.unwrapped.swing_over_limit is False
+    assert raw.unwrapped.episode_success is False
 
 
 class _FakeRawBuilder:
